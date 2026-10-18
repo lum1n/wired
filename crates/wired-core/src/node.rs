@@ -400,13 +400,19 @@ impl Node {
         Some(if selected.is_ip() { PathKind::Direct } else { PathKind::Relay })
     }
 
-    /// Shuts the node down. Pending `Listener::accept` calls return `None`.
+    /// Shuts the node down, the relay it serves included. Pending `Listener::accept` calls return
+    /// `None`.
     pub async fn close(&self) {
         for t in self.inner.tasks.lock().unwrap().drain(..) {
             t.abort();
         }
         self.inner.services.lock().unwrap().clear();
         self.inner.ep.close().await;
+        // Free the relay's ports now, not whenever the last handle to this node is dropped.
+        let relay = self.inner.relay.as_ref().and_then(|r| r.server.lock().unwrap().take());
+        if let Some(server) = relay {
+            let _ = server.shutdown().await;
+        }
     }
 }
 

@@ -261,3 +261,16 @@ async fn relay_behind_a_tls_proxy_with_a_ca_certificate() {
     home.close().await;
     std::fs::remove_file(ca_file).ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_node_frees_its_relay_port() {
+    init_logs();
+    let home = unreachable_root().await;
+    let robin = vm("robin", &home).await;
+    let (_, local) = robin.served_relay().unwrap();
+    robin.close().await;
+    // Kept alive on purpose: closing must not wait for the last handle to go.
+    let _still_held = robin;
+    TcpListener::bind(local).await.expect("the relay's port is still taken after close");
+    home.close().await;
+}

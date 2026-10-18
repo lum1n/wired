@@ -80,7 +80,8 @@ pub(crate) struct ServedRelay {
     /// Where it listens (for `BehindProxy`, what the proxy forwards to).
     pub(crate) local_addr: SocketAddr,
     pub(crate) denied: Arc<RwLock<BTreeSet<[u8; 32]>>>,
-    _server: Server,
+    /// Taken by `Node::close`, which shuts it down so its port is free again at once.
+    pub(crate) server: std::sync::Mutex<Option<Server>>,
 }
 
 pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8; 16]) -> Result<ServedRelay> {
@@ -131,7 +132,7 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
             (server, info, http)
         }
     };
-    Ok(ServedRelay { info, local_addr, denied, _server: server })
+    Ok(ServedRelay { info, local_addr, denied, server: std::sync::Mutex::new(Some(server)) })
 }
 
 /// `[v6]` for IPv6 literals, as URLs and `host:port` need.
