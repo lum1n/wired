@@ -22,6 +22,8 @@ tracing = "0.1"
 thiserror = "2"
 rcgen = "0.14"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = "1"
+url = "2"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "std", "ring"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

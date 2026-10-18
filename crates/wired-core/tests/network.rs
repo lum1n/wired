@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wired_core::{AnchorConfig, Invite, NetworkSecret, Node};
+use wired_core::{AnchorConfig, Invite, NetworkSecret, Node, RelayServe};
 
 fn init_logs() {
     let _ = tracing_subscriber::fmt()
@@ -12,17 +12,16 @@ fn init_logs() {
 
 fn local_anchor() -> AnchorConfig {
     let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    AnchorConfig {
-        bind: lo,
-        relay_bind: lo,
-        qad_bind: Some(lo),
-        public_host: Some("127.0.0.1".into()),
-        replica_of: None,
-    }
+    AnchorConfig { bind: lo, public_host: Some("127.0.0.1".into()), replica_of: None }
+}
+
+fn local_relay() -> RelayServe {
+    let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    RelayServe::Public { bind: lo, qad_bind: Some(lo), public_host: Some("127.0.0.1".into()) }
 }
 
 async fn anchor(name: &str) -> Node {
-    Node::builder(name).anchor(local_anchor()).ephemeral().spawn().await.unwrap()
+    Node::builder(name).anchor(local_anchor()).relay(local_relay()).ephemeral().spawn().await.unwrap()
 }
 
 async fn member(name: &str, invite: &str) -> anyhow::Result<Node> {

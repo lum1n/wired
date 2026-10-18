@@ -113,6 +113,7 @@ impl Inner {
             // Only needed the first time this key joins; cheap to always send.
             proof: Some(self.join_proof(conn)?),
             anchor: self.anchor.as_ref().map(|a| a.info.clone()),
+            relay: self.relay.as_ref().map(|r| r.info.clone()),
         };
         let (_, _, reply) = request(conn, &open).await?;
         let Reply::Joined { cert: mine, anchor: theirs } = reply else { return Err(reply_err(reply)) };
@@ -149,7 +150,7 @@ impl Inner {
         {
             *self.secret.write().unwrap() = secret;
         }
-        self.learn_anchors(&snap.anchors).await;
+        self.learn_network(&snap).await;
         if snap.denied.contains(self.ep.id().as_bytes()) {
             error!("this node has been revoked from the network");
         }

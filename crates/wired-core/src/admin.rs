@@ -53,12 +53,27 @@ fn dispatch(node: &Node, line: &str) -> Result<String> {
             node.approve_anchor(id.parse().context("not a node id")?)?;
             "approved\n".into()
         }
+        ["relays"] => node
+            .relays()
+            .iter()
+            .map(|r| format!("{}\t{}\n", r.url, if r.pin.is_some() { "pinned" } else { "ca" }))
+            .collect(),
+        ["relay", "add", url] => {
+            node.add_relay(url)?;
+            "added\n".into()
+        }
+        ["relay", "remove", url] => {
+            node.remove_relay(url)?;
+            "removed\n".into()
+        }
         ["members"] => node
             .members()
             .iter()
             .map(|m| format!("{}\t{}\t{}\n", m.name, m.id, if m.anchor { "anchor" } else { "member" }))
             .collect(),
-        _ => bail!("unknown command {line:?}; try invite, rotate, revoke <name>, approve <id>, members"),
+        _ => bail!(
+            "unknown command {line:?}; try invite, rotate, revoke <name>, approve <id>, members, relays, relay add|remove <url>"
+        ),
     })
 }
 

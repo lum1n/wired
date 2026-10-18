@@ -182,3 +182,25 @@ func TestAllowlistAndRevoke(t *testing.T) {
 	}
 	ln.Close()
 }
+
+func TestAddAndRemoveRelay(t *testing.T) {
+	vps := testAnchor(t)
+	if err := vps.AddRelay("https://relay.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range vps.Relays() {
+		if r.URL == "https://relay.example.com" && !r.Pinned {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("relay not listed: %+v", vps.Relays())
+	}
+	if err := vps.RemoveRelay("https://relay.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := vps.AddRelay("ftp://nope"); err == nil {
+		t.Fatal("accepted a non-http relay url")
+	}
+}

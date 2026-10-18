@@ -89,6 +89,26 @@ class Node {
     return this._inner.members()
   }
 
+  /** The network's relays, as `{ url, pinned, owner }`. */
+  relays() {
+    return this._inner.relays()
+  }
+
+  /** The relay this node serves, as `{ url, localAddr }`, or null. */
+  get servedRelay() {
+    return this._inner.servedRelay ?? null
+  }
+
+  /** Root only: lists a relay (e.g. `https://robin.exe.xyz`) for the whole network. */
+  addRelay(url) {
+    return this._inner.addRelay(url)
+  }
+
+  /** Root only: stops listing a relay. */
+  removeRelay(url) {
+    return this._inner.removeRelay(url)
+  }
+
   /** Root only: removes `name` now; returns the new invite. */
   revoke(name) {
     return this._inner.revoke(name)
@@ -156,6 +176,57 @@ class Node {
   }
 }
 
+/** Paths a relay serves; iroh clients use them at the root of the relay's URL. */
+const RELAY_PATHS = new Set(['/relay', '/ping'])
+
+/**
+ * Forwards a relay's traffic from your own HTTP server to the relay a node
+ * serves behind it (`relayUrl` + `relayBind`). Use it where the platform gives
+ * you one HTTPS port, like exe.dev:
+ *
+ *   const relay = relayProxy('127.0.0.1:8790')
+ *   server.on('request', (req, res) => relay.matches(req) ? relay.request(req, res) : app(req, res))
+ *   server.on('upgrade', (req, socket, head) => relay.matches(req) && relay.upgrade(req, socket, head))
+ */
+function relayProxy(localAddr) {
+  const i = localAddr.lastIndexOf(':')
+  const host = localAddr.slice(0, i).replace(/^\[|\]$/g, '')
+  const port = Number(localAddr.slice(i + 1))
+  return {
+    matches(req) {
+      return RELAY_PATHS.has((req.url || '').split('?')[0])
+    },
+    request(req, res) {
+      const up = http.request({ host, port, method: req.method, path: req.url, headers: req.headers }, (r) => {
+        res.writeHead(r.statusCode, r.headers)
+        r.pipe(res)
+      })
+      up.on('error', () => {
+        if (!res.headersSent) res.writeHead(502)
+        res.end()
+      })
+      req.pipe(up)
+    },
+    upgrade(req, socket, head) {
+      const up = net.connect(port, host, () => {
+        const lines = [`${req.method} ${req.url} HTTP/1.1`]
+        for (let j = 0; j < req.rawHeaders.length; j += 2) lines.push(`${req.rawHeaders[j]}: ${req.rawHeaders[j + 1]}`)
+        up.write(lines.join('\r\n') + '\r\n\r\n')
+        if (head && head.length) up.write(head)
+        socket.pipe(up).pipe(socket)
+      })
+      const close = () => {
+        socket.destroy()
+        up.destroy()
+      }
+      up.on('error', close)
+      socket.on('error', close)
+      up.on('close', () => socket.destroy())
+      socket.on('close', () => up.destroy())
+    },
+  }
+}
+
 /** `api.laptop.wired` -> `api@laptop`. */
 function hostToTarget(host) {
   const m = /^([a-z0-9-]+)\.([a-z0-9-]+)\.wired\.?$/.exec(host || '')
@@ -163,4 +234,4 @@ function hostToTarget(host) {
   return `${m[1]}@${m[2]}`
 }
 
-module.exports = { Node, WiredServer }
+module.exports = { Node, WiredServer, relayProxy, hostToTarget }

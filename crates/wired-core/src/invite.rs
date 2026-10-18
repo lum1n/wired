@@ -46,17 +46,29 @@ impl NetworkSecret {
     }
 }
 
-/// How to reach one anchor.
+/// How to reach one anchor directly (relays are listed separately).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorInfo {
     /// The anchor's Ed25519 public key (its endpoint id).
     pub id: [u8; 32],
-    /// Relay URL served by the anchor, e.g. `http://vps.example.com:7443`.
-    pub relay_url: String,
-    /// Direct UDP addresses as `host:port`; hostnames are resolved at join time.
+    /// Direct UDP addresses as `host:port`; hostnames are resolved when used.
+    /// May be empty for an anchor that is only reachable through relays.
     pub addrs: Vec<String>,
-    /// UDP port of the relay's QUIC address discovery, if enabled.
+}
+
+/// A relay nodes use to find each other and to fall back to. Relays hold no
+/// keys and only ever see ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayInfo {
+    /// e.g. `https://vps.example.com:7443` or `https://robin.exe.xyz`.
+    pub url: String,
+    /// Key the relay's TLS certificate must carry (self-signed relays).
+    /// `None`: the certificate is checked against the usual CA roots.
+    pub pin: Option<[u8; 32]>,
+    /// UDP port of the relay's QUIC address discovery, if it has one.
     pub qad_port: Option<u16>,
+    /// The member serving it; revoking that member removes the relay.
+    pub owner: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,11 +81,18 @@ pub struct Invite {
     /// Join secret for new keys. Rotated when a node is revoked.
     pub secret: NetworkSecret,
     pub anchors: Vec<AnchorInfo>,
+    pub relays: Vec<RelayInfo>,
 }
 
 impl Invite {
-    pub fn new(network_id: [u8; 16], root: [u8; 32], secret: NetworkSecret, anchors: Vec<AnchorInfo>) -> Self {
-        Self { version: VERSION, network_id, root, secret, anchors }
+    pub fn new(
+        network_id: [u8; 16],
+        root: [u8; 32],
+        secret: NetworkSecret,
+        anchors: Vec<AnchorInfo>,
+        relays: Vec<RelayInfo>,
+    ) -> Self {
+        Self { version: VERSION, network_id, root, secret, anchors, relays }
     }
 
     pub fn encode(&self) -> String {
@@ -115,12 +134,8 @@ mod tests {
             [3; 16],
             [7; 32],
             NetworkSecret::generate(),
-            vec![AnchorInfo {
-                id: [7; 32],
-                relay_url: "http://vps.example.com:7443".into(),
-                addrs: vec!["vps.example.com:7443".into(), "203.0.113.5:7443".into()],
-                qad_port: Some(7842),
-            }],
+            vec![AnchorInfo { id: [7; 32], addrs: vec!["vps.example.com:7443".into(), "203.0.113.5:7443".into()] }],
+            vec![RelayInfo { url: "https://robin.exe.xyz".into(), pin: None, qad_port: None, owner: Some([9; 32]) }],
         )
     }
 

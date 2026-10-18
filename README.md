@@ -4,14 +4,14 @@ Wired is an embeddable library that lets services talk to each other over an enc
 
 - **Encrypted and authenticated.** Traffic uses QUIC with TLS 1.3. Every node is an Ed25519 key, and there is no CA.
 - **Works behind NAT.** Nodes punch through NATs to connect directly. When that fails, traffic falls back to a relay, which only ever sees ciphertext.
-- **Self-hosted.** The relay, membership and name lookup all run inside the library on one publicly reachable node (the *anchor*). There are no third-party servers.
+- **Self-hosted.** Membership and name lookup run inside the library on the *anchor*, which can sit behind NAT. Relays (for finding each other across networks) run inside the library too, on any reachable node, even behind an HTTPS proxy like exe.dev's. There are no third-party servers.
 - **Named services.** Services are addressed as `service@node`, for example `api@laptop`.
 
 Built on [iroh](https://iroh.computer), with all of n0's default infrastructure turned off.
 
 ## The 60-second version
 
-On a VPS with a public IP, start the anchor and forward a local port to the laptop's service:
+On a VPS with a public IP, start the anchor (it serves a relay too) and forward a local port to the laptop's service:
 
 ```sh
 wired anchor --name vps --forward 127.0.0.1:9000=api@laptop   # prints an invite: wired1…
@@ -37,8 +37,8 @@ The anchor needs **UDP 7443** (peers), **TCP 7443** (relay) and **UDP 7842** (ad
 ## Embedding (Rust)
 
 ```rust
-// Public host
-let vps = wired::Node::builder("vps").anchor(Default::default()).spawn().await?;
+// Public host: anchor plus a relay
+let vps = wired::Node::builder("vps").anchor(Default::default()).relay(wired::RelayServe::public()).spawn().await?;
 println!("{}", vps.invite());
 
 // Anywhere else (reads WIRED_INVITE, or use .invite(...))
@@ -88,6 +88,25 @@ for try await stream in try laptop.listen(service: "api").streams {
     try await stream.finish()
 }
 ```
+
+## Anchor behind NAT, relays elsewhere
+
+The anchor doesn't have to be reachable. Run it on your laptop without a relay, and let reachable nodes serve relays, even behind a TLS-terminating proxy that gives you one HTTPS port, like exe.dev:
+
+```sh
+# laptop (root, behind NAT)
+wired anchor --name home --no-relay
+
+# tell the network about the VM's relay before the VM joins through it
+wired relay add https://robin.exe.xyz
+
+# robin (exe.dev VM): its proxy forwards /relay and /ping to 127.0.0.1:8790
+wired join --name robin --relay-url https://robin.exe.xyz --relay-bind 127.0.0.1:8790
+```
+
+If your app already owns the HTTPS port, forward just those two paths. In Node: `relayProxy('127.0.0.1:8790')` gives `matches`, `request` and `upgrade` handlers for an `http.Server`.
+
+The relay admits only this network's nodes (it checks a token derived from the network, and refuses revoked keys). It only ever sees ciphertext.
 
 ## Access control
 

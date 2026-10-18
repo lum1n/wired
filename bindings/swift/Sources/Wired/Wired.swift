@@ -734,6 +734,11 @@ public func FfiConverterTypeWiredListener_lower(_ value: WiredListener) -> UInt6
 public protocol WiredNodeProtocol: AnyObject, Sendable {
     
     /**
+     * Root only: lists a relay (e.g. `https://robin.exe.xyz`) for the whole network.
+     */
+    func addRelay(url: String) throws 
+    
+    /**
      * Root only: lets the replica anchor with this id join.
      */
     func approveAnchor(id: String) throws 
@@ -776,6 +781,13 @@ public protocol WiredNodeProtocol: AnyObject, Sendable {
     func name()  -> String
     
     func path(node: String)  -> PathKind?
+    
+    func relays()  -> [RelayEntry]
+    
+    /**
+     * Root only: stops listing a relay.
+     */
+    func removeRelay(url: String) throws 
     
     /**
      * Root only: removes a node now; returns the new invite.
@@ -840,6 +852,18 @@ open class WiredNode: WiredNodeProtocol, @unchecked Sendable {
 
     
 
+    
+    /**
+     * Root only: lists a relay (e.g. `https://robin.exe.xyz`) for the whole network.
+     */
+open func addRelay(url: String)throws   {try rustCallWithError(FfiConverterTypeWiredError_lift) {
+        uniffiCallStatus in
+    uniffi_wired_swift_fn_method_wirednode_add_relay(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),uniffiCallStatus
+    )
+}
+}
     
     /**
      * Root only: lets the replica anchor with this id join.
@@ -1002,6 +1026,27 @@ open func path(node: String) -> PathKind?  {
         FfiConverterString.lower(node),uniffiCallStatus
     )
 })
+}
+    
+open func relays() -> [RelayEntry]  {
+    return try!  FfiConverterSequenceTypeRelayEntry.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wired_swift_fn_method_wirednode_relays(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Root only: stops listing a relay.
+     */
+open func removeRelay(url: String)throws   {try rustCallWithError(FfiConverterTypeWiredError_lift) {
+        uniffiCallStatus in
+    uniffi_wired_swift_fn_method_wirednode_remove_relay(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -1415,6 +1460,15 @@ public struct AnchorOptions: Equatable, Hashable {
      * Run as a replica of the network this invite is for.
      */
     public var replicaOf: String?
+    /**
+     * Don't serve a relay (this machine isn't reachable from the internet).
+     */
+    public var noRelay: Bool
+    /**
+     * Serve the relay behind a TLS-terminating proxy at this URL instead. Needs `relay_bind`.
+     */
+    public var relayUrl: String?
+    public var relayBind: String?
     public var stateDir: String?
     public var ephemeral: Bool
 
@@ -1429,7 +1483,13 @@ public struct AnchorOptions: Equatable, Hashable {
          */qadPort: UInt16 = UInt16(7842), noQad: Bool = false, publicHost: String? = nil, 
         /**
          * Run as a replica of the network this invite is for.
-         */replicaOf: String? = nil, stateDir: String? = nil, ephemeral: Bool = false) {
+         */replicaOf: String? = nil, 
+        /**
+         * Don't serve a relay (this machine isn't reachable from the internet).
+         */noRelay: Bool = false, 
+        /**
+         * Serve the relay behind a TLS-terminating proxy at this URL instead. Needs `relay_bind`.
+         */relayUrl: String? = nil, relayBind: String? = nil, stateDir: String? = nil, ephemeral: Bool = false) {
         self.name = name
         self.bindHost = bindHost
         self.port = port
@@ -1437,6 +1497,9 @@ public struct AnchorOptions: Equatable, Hashable {
         self.noQad = noQad
         self.publicHost = publicHost
         self.replicaOf = replicaOf
+        self.noRelay = noRelay
+        self.relayUrl = relayUrl
+        self.relayBind = relayBind
         self.stateDir = stateDir
         self.ephemeral = ephemeral
     }
@@ -1464,6 +1527,9 @@ public struct FfiConverterTypeAnchorOptions: FfiConverterRustBuffer {
                 noQad: FfiConverterBool.read(from: &buf), 
                 publicHost: FfiConverterOptionString.read(from: &buf), 
                 replicaOf: FfiConverterOptionString.read(from: &buf), 
+                noRelay: FfiConverterBool.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayBind: FfiConverterOptionString.read(from: &buf), 
                 stateDir: FfiConverterOptionString.read(from: &buf), 
                 ephemeral: FfiConverterBool.read(from: &buf)
         )
@@ -1477,6 +1543,9 @@ public struct FfiConverterTypeAnchorOptions: FfiConverterRustBuffer {
         FfiConverterBool.write(value.noQad, into: &buf)
         FfiConverterOptionString.write(value.publicHost, into: &buf)
         FfiConverterOptionString.write(value.replicaOf, into: &buf)
+        FfiConverterBool.write(value.noRelay, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayBind, into: &buf)
         FfiConverterOptionString.write(value.stateDir, into: &buf)
         FfiConverterBool.write(value.ephemeral, into: &buf)
     }
@@ -1506,17 +1575,33 @@ public struct JoinOptions: Equatable, Hashable {
     public var invite: String?
     public var stateDir: String?
     public var ephemeral: Bool
+    /**
+     * Serve a relay behind a TLS-terminating proxy, reached at this URL. Needs `relay_bind`.
+     */
+    public var relayUrl: String?
+    /**
+     * Local address the relay listens on, e.g. `127.0.0.1:8790`.
+     */
+    public var relayBind: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(name: String, 
         /**
          * Defaults to the WIRED_INVITE environment variable.
-         */invite: String? = nil, stateDir: String? = nil, ephemeral: Bool = false) {
+         */invite: String? = nil, stateDir: String? = nil, ephemeral: Bool = false, 
+        /**
+         * Serve a relay behind a TLS-terminating proxy, reached at this URL. Needs `relay_bind`.
+         */relayUrl: String? = nil, 
+        /**
+         * Local address the relay listens on, e.g. `127.0.0.1:8790`.
+         */relayBind: String? = nil) {
         self.name = name
         self.invite = invite
         self.stateDir = stateDir
         self.ephemeral = ephemeral
+        self.relayUrl = relayUrl
+        self.relayBind = relayBind
     }
 
     
@@ -1538,7 +1623,9 @@ public struct FfiConverterTypeJoinOptions: FfiConverterRustBuffer {
                 name: FfiConverterString.read(from: &buf), 
                 invite: FfiConverterOptionString.read(from: &buf), 
                 stateDir: FfiConverterOptionString.read(from: &buf), 
-                ephemeral: FfiConverterBool.read(from: &buf)
+                ephemeral: FfiConverterBool.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayBind: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1547,6 +1634,8 @@ public struct FfiConverterTypeJoinOptions: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.invite, into: &buf)
         FfiConverterOptionString.write(value.stateDir, into: &buf)
         FfiConverterBool.write(value.ephemeral, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayBind, into: &buf)
     }
 }
 
@@ -1621,6 +1710,60 @@ public func FfiConverterTypeMemberInfo_lift(_ buf: RustBuffer) throws -> MemberI
 #endif
 public func FfiConverterTypeMemberInfo_lower(_ value: MemberInfo) -> RustBuffer {
     return FfiConverterTypeMemberInfo.lower(value)
+}
+
+
+public struct RelayEntry: Equatable, Hashable {
+    public var url: String
+    public var pinned: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, pinned: Bool) {
+        self.url = url
+        self.pinned = pinned
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RelayEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayEntry {
+        return
+            try RelayEntry(
+                url: FfiConverterString.read(from: &buf), 
+                pinned: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterBool.write(value.pinned, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayEntry_lift(_ buf: RustBuffer) throws -> RelayEntry {
+    return try FfiConverterTypeRelayEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayEntry_lower(_ value: RelayEntry) -> RustBuffer {
+    return FfiConverterTypeRelayEntry.lower(value)
 }
 
 
@@ -1933,6 +2076,31 @@ fileprivate struct FfiConverterSequenceTypeMemberInfo: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeRelayEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [RelayEntry]
+
+    public static func write(_ value: [RelayEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRelayEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RelayEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RelayEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRelayEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -2043,6 +2211,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wired_swift_checksum_method_wiredlistener_close() != 63816) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wired_swift_checksum_method_wirednode_add_relay() != 55112) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wired_swift_checksum_method_wirednode_approve_anchor() != 9547) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2080,6 +2251,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wired_swift_checksum_method_wirednode_path() != 21105) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wired_swift_checksum_method_wirednode_relays() != 34778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wired_swift_checksum_method_wirednode_remove_relay() != 16487) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wired_swift_checksum_method_wirednode_revoke() != 25075) {

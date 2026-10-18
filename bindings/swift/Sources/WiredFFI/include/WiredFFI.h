@@ -273,6 +273,11 @@ uint64_t uniffi_wired_swift_fn_clone_wirednode(uint64_t handle, RustCallStatus *
 void uniffi_wired_swift_fn_free_wirednode(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_ADD_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_ADD_RELAY
+void uniffi_wired_swift_fn_method_wirednode_add_relay(uint64_t ptr, RustBuffer url, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_APPROVE_ANCHOR
 #define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_APPROVE_ANCHOR
 void uniffi_wired_swift_fn_method_wirednode_approve_anchor(uint64_t ptr, RustBuffer id, RustCallStatus *_Nonnull out_status
@@ -336,6 +341,16 @@ RustBuffer uniffi_wired_swift_fn_method_wirednode_name(uint64_t ptr, RustCallSta
 #ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_PATH
 #define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_PATH
 RustBuffer uniffi_wired_swift_fn_method_wirednode_path(uint64_t ptr, RustBuffer node, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_RELAYS
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_RELAYS
+RustBuffer uniffi_wired_swift_fn_method_wirednode_relays(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_REMOVE_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_REMOVE_RELAY
+void uniffi_wired_swift_fn_method_wirednode_remove_relay(uint64_t ptr, RustBuffer url, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_FN_METHOD_WIREDNODE_REVOKE
@@ -697,6 +712,12 @@ uint16_t uniffi_wired_swift_checksum_method_wiredlistener_close(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_ADD_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_ADD_RELAY
+uint16_t uniffi_wired_swift_checksum_method_wirednode_add_relay(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_APPROVE_ANCHOR
 #define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_APPROVE_ANCHOR
 uint16_t uniffi_wired_swift_checksum_method_wirednode_approve_anchor(void
@@ -772,6 +793,18 @@ uint16_t uniffi_wired_swift_checksum_method_wirednode_name(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_PATH
 #define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_PATH
 uint16_t uniffi_wired_swift_checksum_method_wirednode_path(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_RELAYS
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_RELAYS
+uint16_t uniffi_wired_swift_checksum_method_wirednode_relays(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_REMOVE_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_WIRED_SWIFT_CHECKSUM_METHOD_WIREDNODE_REMOVE_RELAY
+uint16_t uniffi_wired_swift_checksum_method_wirednode_remove_relay(void
     
 );
 #endif

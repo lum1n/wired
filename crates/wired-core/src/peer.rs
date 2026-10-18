@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use iroh::{
-    EndpointAddr, PublicKey, RelayUrl, TransportAddr,
+    EndpointAddr, PublicKey, TransportAddr,
     endpoint::{Connection, Incoming, RecvStream, SendStream},
 };
 use tracing::debug;
@@ -136,8 +136,7 @@ impl Inner {
 
     async fn connect_hello(self: &Arc<Self>, id: PublicKey) -> Result<Peer> {
         ensure!(id != self.ep.id(), "cannot dial ourselves");
-        let relays: Vec<RelayUrl> = self.snapshot().anchors.iter().filter_map(|a| a.relay_url.parse().ok()).collect();
-        let addr = EndpointAddr::from_parts(id, relays.into_iter().map(TransportAddr::Relay));
+        let addr = EndpointAddr::from_parts(id, self.relay_urls().into_iter().map(TransportAddr::Relay));
         let conn = self.ep.connect(addr, crate::proto::ALPN).await.context("connect")?;
         let open = Open::Hello { version: PROTOCOL_VERSION, cert: self.own_cert()? };
         let (_, _, reply) = request(&conn, &open).await?;
@@ -195,8 +194,8 @@ impl Inner {
         let own =
             || self.own_cert().map_err(|_| Refusal(ErrorCode::NotApproved, "this anchor is not ready yet".into()));
         match open {
-            Open::Join { version, network_id, name, proof, anchor } if self.anchor.is_some() => {
-                let cert = self.admit(conn, version, network_id, &name, proof, anchor)?;
+            Open::Join { version, network_id, name, proof, anchor, relay } if self.anchor.is_some() => {
+                let cert = self.admit(conn, version, network_id, &name, proof, anchor, relay)?;
                 Ok((Reply::Joined { cert, anchor: own()? }, name, *self.ep.id().as_bytes()))
             }
             Open::Join { .. } => Err(Refusal(ErrorCode::Protocol, "not an anchor".into())),

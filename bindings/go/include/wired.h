@@ -10,11 +10,15 @@ typedef struct WiredListener WiredListener;
 /* Calls returning int: 0 = ok, -1 = error with a message in *err (free with wired_string_free). */
 void wired_string_free(char *s);
 
+/* relay_url/relay_bind (nullable): serve a relay behind a TLS-terminating proxy. */
 int wired_join(const char *name, const char *invite, const char *state_dir, int ephemeral,
-               WiredNode **out, char **err);
-/* qad_port < 0 disables QUIC address discovery. replica_of (nullable): invite to replicate. */
+               const char *relay_url, const char *relay_bind, WiredNode **out, char **err);
+/* Relay: behind a proxy when relay_url/relay_bind are set; none when no_relay;
+   otherwise public on port (qad_port < 0 disables address discovery).
+   replica_of (nullable): invite of the network to replicate. */
 int wired_anchor(const char *name, const char *bind_host, uint16_t port, int32_t qad_port,
-                 const char *public_host, const char *replica_of, const char *state_dir, int ephemeral,
+                 const char *public_host, const char *replica_of, int no_relay,
+                 const char *relay_url, const char *relay_bind, const char *state_dir, int ephemeral,
                  WiredNode **out, char **err);
 
 char *wired_node_name(const WiredNode *n);
@@ -27,6 +31,10 @@ char *wired_members(const WiredNode *n);
 /* Root only. *invite receives the new invite (free with wired_string_free). */
 int wired_revoke(const WiredNode *n, const char *name, char **invite, char **err);
 int wired_rotate_invite(const WiredNode *n, char **invite, char **err);
+/* One relay per line: url<TAB>pinned|ca. */
+char *wired_relays(const WiredNode *n);
+int wired_add_relay(const WiredNode *n, const char *url, char **err);
+int wired_remove_relay(const WiredNode *n, const char *url, char **err);
 int wired_approve_anchor(const WiredNode *n, const char *id, char **err);
 
 /* Blocks; *fd receives a non-blocking socket descriptor owned by the caller. */

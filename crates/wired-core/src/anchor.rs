@@ -8,14 +8,14 @@ use std::{
 
 use crate::{
     cert, frame,
-    invite::{AnchorInfo, NetworkSecret},
+    invite::{AnchorInfo, NetworkSecret, RelayInfo},
     node::{Inner, Node, valid_name},
     peer::Refusal,
     proto::{Cert, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, PROTOCOL_VERSION, Reply, Role, Snapshot},
+    relay::same_url,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use iroh::{PublicKey, endpoint::Connection, endpoint::SendStream};
-use iroh_relay::server::Server;
 use tokio::sync::watch;
 
 pub(crate) struct AnchorState {
@@ -25,7 +25,6 @@ pub(crate) struct AnchorState {
     pub(crate) approved: Mutex<BTreeSet<[u8; 32]>>,
     /// Latest snapshot, for `Watch` streams.
     pub(crate) updates: watch::Sender<Arc<Snapshot>>,
-    pub(crate) _relay: Server,
 }
 
 impl Inner {
@@ -49,9 +48,17 @@ impl Inner {
         self.snapshot_changed(snap);
     }
 
-    /// After the snapshot changed (locally or by replication): enforce, persist, publish.
+    /// After the snapshot changed (locally or by replication): enforce,
+    /// reconfigure relays, persist, publish.
     pub(crate) fn snapshot_changed(&self, snap: Arc<Snapshot>) {
         self.enforce_denied(&snap);
+        if let Some(r) = &self.relay {
+            *r.denied.write().unwrap() = snap.denied.clone();
+        }
+        if let Some(me) = self.me.upgrade() {
+            let snap = snap.clone();
+            self.rt.spawn(async move { me.learn_network(&snap).await });
+        }
         if let Some(a) = &self.anchor {
             a.updates.send_replace(snap);
         }
@@ -63,6 +70,7 @@ impl Inner {
     /// Keys already in the network renew without a proof (TLS proved the key).
     /// New keys need a valid proof of the current join secret and can only
     /// join at the root, so names are assigned in exactly one place.
+    #[allow(clippy::too_many_arguments)] // the fields of `Open::Join`
     pub(crate) fn admit(
         &self,
         conn: &Connection,
@@ -71,6 +79,7 @@ impl Inner {
         name: &str,
         proof: Option<[u8; 32]>,
         anchor: Option<AnchorInfo>,
+        relay: Option<RelayInfo>,
     ) -> Result<Cert, Refusal> {
         let remote = conn.remote_id();
         let rk = *remote.as_bytes();
@@ -143,6 +152,12 @@ impl Inner {
             }
         }
 
+        // A member serving a relay: list it, owned by that member. Only the
+        // root changes the network; elsewhere the member re-announces later.
+        if root && let Some(r) = relay {
+            self.update_snapshot(|s| upsert_relay(s, RelayInfo { owner: Some(rk), ..r }));
+        }
+
         let role = if root && self.snapshot().is_anchor(&rk) { Role::Anchor } else { Role::Member };
         let issuer_cert = match root {
             true => None,
@@ -186,6 +201,15 @@ fn not_approved(key: PublicKey) -> Refusal {
     Refusal(ErrorCode::NotApproved, format!("run `wired approve {key}` on the root anchor"))
 }
 
+fn upsert_relay(s: &mut Snapshot, info: RelayInfo) -> bool {
+    if s.relays.contains(&info) {
+        return false;
+    }
+    s.relays.retain(|r| !same_url(&r.url, &info.url));
+    s.relays.push(info);
+    true
+}
+
 fn upsert_anchor(s: &mut Snapshot, info: AnchorInfo) -> bool {
     if s.anchors.contains(&info) {
         return false;
@@ -217,6 +241,7 @@ impl Node {
         inner.update_snapshot(|s| {
             s.members.remove(name);
             s.anchors.retain(|a| a.id != key);
+            s.relays.retain(|r| r.owner != Some(key));
             s.denied.insert(key);
             true
         });
@@ -231,6 +256,41 @@ impl Node {
         // Bump the version so replicas pick up the new secret.
         self.inner.update_snapshot(|_| true);
         Ok(self.invite())
+    }
+
+    /// Lists a relay at `url` for the whole network, e.g. a relay another node
+    /// serves behind a proxy (`https://robin.exe.xyz`). Every node connects to
+    /// it, so a node can then join *through* it. Its certificate is checked
+    /// against the usual CA roots.
+    pub fn add_relay(&self, url: &str) -> Result<()> {
+        self.require_root("add relays")?;
+        let parsed: url::Url = url.parse().with_context(|| format!("bad relay url {url}"))?;
+        ensure!(matches!(parsed.scheme(), "https" | "http"), "relay url must be https:// (or http:// for testing)");
+        ensure!(parsed.path() == "/" && parsed.query().is_none(), "relay url must be an origin, like https://host");
+        let url = parsed.as_str().trim_end_matches('/').to_string();
+        self.inner.update_snapshot(|s| {
+            // Keep an entry the relay's own node announced (it knows more).
+            if s.relays.iter().any(|r| same_url(&r.url, &url)) {
+                return false;
+            }
+            s.relays.push(RelayInfo { url, pin: None, qad_port: None, owner: None });
+            true
+        });
+        Ok(())
+    }
+
+    /// Stops listing a relay. A member that serves it lists it again when it renews.
+    pub fn remove_relay(&self, url: &str) -> Result<()> {
+        self.require_root("remove relays")?;
+        let mut found = false;
+        self.inner.update_snapshot(|s| {
+            let before = s.relays.len();
+            s.relays.retain(|r| !same_url(&r.url, url));
+            found = s.relays.len() != before;
+            found
+        });
+        ensure!(found, "no relay {url}");
+        Ok(())
     }
 
     /// Allows the replica with this key to become an anchor. It registers

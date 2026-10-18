@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::invite::{AnchorInfo, NetworkSecret};
+use crate::invite::{AnchorInfo, NetworkSecret, RelayInfo};
 
 pub const ALPN: &[u8] = b"wired/1";
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -63,6 +63,8 @@ pub struct Snapshot {
     pub denied: BTreeSet<[u8; 32]>,
     /// Every anchor, root included.
     pub anchors: Vec<AnchorInfo>,
+    /// Every relay. Nodes connect to all of them as needed.
+    pub relays: Vec<RelayInfo>,
     /// Current join secret; only sent to anchors.
     pub secret: Option<NetworkSecret>,
 }
@@ -89,6 +91,8 @@ pub enum Open {
         proof: Option<[u8; 32]>,
         /// Set by a replica anchor asking to be (re)registered.
         anchor: Option<AnchorInfo>,
+        /// Set by a node that serves a relay, so the root lists it.
+        relay: Option<RelayInfo>,
     },
     /// Present a certificate to another node.
     Hello { version: u8, cert: Cert },

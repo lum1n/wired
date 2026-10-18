@@ -20,9 +20,13 @@ thiserror.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 webpki.workspace = true
+webpki-roots.workspace = true
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+iroh.workspace = true
+iroh-relay.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

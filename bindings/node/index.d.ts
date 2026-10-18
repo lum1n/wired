@@ -1,5 +1,6 @@
 import type { Socket } from 'node:net'
-import type { Agent, AgentOptions } from 'node:http'
+import type { Agent, AgentOptions, IncomingMessage, ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
 import type { EventEmitter } from 'node:events'
 
 export interface JoinOptions {
@@ -9,6 +10,12 @@ export interface JoinOptions {
   stateDir?: string
   /** Keep keys in memory only. */
   ephemeral?: boolean
+  /** Serve a relay behind a TLS-terminating proxy, reached at this URL (e.g. https://robin.exe.xyz). Needs relayBind. */
+  relayUrl?: string
+  /** Local address the relay listens on, e.g. 127.0.0.1:8790. */
+  relayBind?: string
+  /** Testing: never connect directly, only through relays. */
+  relayOnly?: boolean
 }
 
 export interface AnchorOptions {
@@ -20,8 +27,15 @@ export interface AnchorOptions {
   /** UDP port for address discovery (default 7842, 0 = any). */
   qadPort?: number
   noQad?: boolean
-  /** Host or IP put in the invite (default: the default route's IP). */
+  /** Host or IP others reach this machine at (default: the default route's IP). */
   publicHost?: string
+  /** Don't serve a relay (this machine isn't reachable from the internet). */
+  noRelay?: boolean
+  /** Serve the relay behind a TLS-terminating proxy at this URL instead. Needs relayBind. */
+  relayUrl?: string
+  relayBind?: string
+  /** Testing: never connect directly, only through relays. */
+  relayOnly?: boolean
   /** Run as a replica of the network this invite is for. */
   replicaOf?: string
   stateDir?: string
@@ -41,6 +55,27 @@ export interface ServiceOptions {
   /** Node names that may connect; default: every member. */
   allow?: string[]
 }
+
+export interface Relay {
+  url: string
+  /** Certificate pinned to a key (self-signed relay) rather than CA-checked. */
+  pinned: boolean
+  /** Id of the node serving it, if a member announced it. */
+  owner?: string
+}
+
+export interface RelayProxy {
+  /** Whether this request is for the relay (`/relay` or `/ping`). */
+  matches(req: IncomingMessage): boolean
+  request(req: IncomingMessage, res: ServerResponse): void
+  upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void
+}
+
+/** Forwards relay traffic from your HTTP server to a relay listening at `localAddr`. */
+export declare function relayProxy(localAddr: string): RelayProxy
+
+/** `api.laptop.wired` -> `api@laptop`; throws for other hosts. */
+export declare function hostToTarget(host: string): string
 
 export interface Member {
   name: string
@@ -70,6 +105,13 @@ export declare class Node {
   readonly isAnchor: boolean
   readonly isRoot: boolean
   members(): Member[]
+  relays(): Relay[]
+  /** The relay this node serves, or null. */
+  readonly servedRelay: { url: string; localAddr: string } | null
+  /** Root only: lists a relay for the whole network. */
+  addRelay(url: string): void
+  /** Root only: stops listing a relay. */
+  removeRelay(url: string): void
   /** Root only: removes a node now; returns the new invite. */
   revoke(name: string): string
   /** Root only: replaces the invite; returns the new one. */

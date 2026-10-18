@@ -3,7 +3,7 @@
 //! ```no_run
 //! # async fn demo() -> anyhow::Result<()> {
 //! // On the public host:
-//! let vps = wired::Node::builder("vps").anchor(Default::default()).spawn().await?;
+//! let vps = wired::Node::builder("vps").anchor(Default::default()).relay(wired::RelayServe::public()).spawn().await?;
 //! println!("{}", vps.invite());
 //!
 //! // On a machine behind NAT, with WIRED_INVITE set:
@@ -15,9 +15,10 @@
 //! # Ok(()) }
 //! ```
 
+pub use wired_core::relay;
 pub use wired_core::{
-    AnchorConfig, Builder, ErrorCode, Invite, Listener, Member, NetworkSecret, Node, PathKind, PeerInfo, PublicKey,
-    RemoteError, SecretKey, Stream, Task,
+    AnchorConfig, AnchorInfo, Builder, ErrorCode, Invite, Listener, Member, NetworkSecret, Node, PathKind, PeerInfo,
+    PublicKey, RelayInfo, RelayServe, RemoteError, SecretKey, Stream, Task,
     node::{parse_target, valid_name},
 };
 #[cfg(unix)]

@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wired_core::{AnchorConfig, ErrorCode, Invite, Node, RemoteError, SecretKey};
+use wired_core::{AnchorConfig, ErrorCode, Invite, Node, RelayServe, RemoteError, SecretKey};
 
 fn init_logs() {
     let _ = tracing_subscriber::fmt()
@@ -14,11 +14,16 @@ fn init_logs() {
 
 fn local_anchor(replica_of: Option<Invite>) -> AnchorConfig {
     let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    AnchorConfig { bind: lo, relay_bind: lo, qad_bind: Some(lo), public_host: Some("127.0.0.1".into()), replica_of }
+    AnchorConfig { bind: lo, public_host: Some("127.0.0.1".into()), replica_of }
+}
+
+fn local_relay() -> RelayServe {
+    let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    RelayServe::Public { bind: lo, qad_bind: Some(lo), public_host: Some("127.0.0.1".into()) }
 }
 
 async fn root(name: &str) -> Node {
-    Node::builder(name).anchor(local_anchor(None)).ephemeral().spawn().await.unwrap()
+    Node::builder(name).anchor(local_anchor(None)).relay(local_relay()).ephemeral().spawn().await.unwrap()
 }
 
 async fn member(name: &str, invite: &str) -> anyhow::Result<Node> {
@@ -139,7 +144,13 @@ async fn replica_keeps_the_network_running_when_the_root_is_down() {
     let invite: Invite = vps.invite().parse().unwrap();
 
     // A replica must be approved before it can serve.
-    let vps2 = Node::builder("vps2").anchor(local_anchor(Some(invite.clone()))).ephemeral().spawn().await.unwrap();
+    let vps2 = Node::builder("vps2")
+        .anchor(local_anchor(Some(invite.clone())))
+        .relay(local_relay())
+        .ephemeral()
+        .spawn()
+        .await
+        .unwrap();
     assert!(!vps.members().iter().any(|m| m.name == "vps2"));
     vps.approve_anchor(vps2.id()).unwrap();
     assert!(
@@ -211,7 +222,7 @@ async fn member_starts_from_cache_when_no_anchor_is_reachable() {
 async fn admin_socket_and_root_restart() {
     init_logs();
     let dir = temp_dir("admin");
-    let spawn_root = || Node::builder("vps").anchor(local_anchor(None)).state_dir(&dir).spawn();
+    let spawn_root = || Node::builder("vps").anchor(local_anchor(None)).relay(local_relay()).state_dir(&dir).spawn();
     let vps = spawn_root().await.unwrap();
     let laptop = member("laptop", &vps.invite()).await.unwrap();
 

@@ -1,8 +1,10 @@
-//! TLS for the anchor's relay, pinned to the anchor's Ed25519 key.
+//! TLS for relays.
 //!
-//! The relay (HTTPS + QUIC address discovery) presents a self-signed certificate
-//! whose key is the anchor's endpoint key. Clients accept a certificate only if
-//! its public key is one of the anchor ids in the invite, so no CA is involved.
+//! A relay on a public IP serves HTTPS and QUIC address discovery with a
+//! self-signed certificate whose key is its node key; clients pin that key.
+//! A relay behind a TLS-terminating proxy (exe.dev, a real domain) presents a
+//! CA-issued certificate, which is checked against the usual roots. Either
+//! way the relay only ever sees ciphertext; TLS here protects metadata.
 
 use std::{
     fmt,
@@ -29,7 +31,7 @@ pub fn provider() -> Arc<CryptoProvider> {
 }
 
 /// A self-signed certificate whose key is `key`, plus that key in PKCS#8 form.
-fn anchor_cert(key: &SecretKey) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> {
+fn relay_cert(key: &SecretKey) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> {
     let mut pkcs8 = ED25519_PKCS8_PREFIX.to_vec();
     pkcs8.extend_from_slice(&key.to_bytes());
     let pkcs8 = PrivatePkcs8KeyDer::from(pkcs8);
@@ -40,8 +42,8 @@ fn anchor_cert(key: &SecretKey) -> Result<(CertificateDer<'static>, PrivatePkcs8
 }
 
 /// A rustls server config presenting a self-signed certificate for `key`.
-pub fn anchor_server_config(key: &SecretKey) -> Result<rustls::ServerConfig> {
-    let (cert, pkcs8) = anchor_cert(key)?;
+pub fn relay_server_config(key: &SecretKey) -> Result<rustls::ServerConfig> {
+    let (cert, pkcs8) = relay_cert(key)?;
     let config = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -58,18 +60,28 @@ fn cert_key(cert: &CertificateDer<'_>) -> Option<PublicKey> {
     PublicKey::from_bytes(raw).ok()
 }
 
-/// Anchor keys whose relays we trust; grows as replicas are approved.
+/// Keys of self-signed relays we trust; grows as relays are added.
 pub type Pinned = Arc<RwLock<Vec<PublicKey>>>;
 
-/// Accepts exactly the certificates whose key is one of `pinned`.
+/// Accepts a certificate whose key is pinned, or else one that chains to the
+/// usual CA roots for the server name.
 pub struct PinnedVerifier {
     pinned: Pinned,
     provider: Arc<CryptoProvider>,
+    webpki: Arc<dyn ServerCertVerifier>,
 }
 
 impl PinnedVerifier {
-    pub fn new(pinned: Pinned, provider: Arc<CryptoProvider>) -> Self {
-        Self { pinned, provider }
+    pub fn new(pinned: Pinned, provider: Arc<CryptoProvider>) -> Result<Self, rustls::Error> {
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .build()
+            .map_err(|e| rustls::Error::General(e.to_string()))?;
+        Ok(Self { pinned, provider, webpki })
+    }
+
+    fn is_pinned(&self, cert: &CertificateDer<'_>) -> bool {
+        cert_key(cert).is_some_and(|k| self.pinned.read().unwrap().contains(&k))
     }
 }
 
@@ -83,24 +95,28 @@ impl ServerCertVerifier for PinnedVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match cert_key(end_entity) {
-            Some(k) if self.pinned.read().unwrap().contains(&k) => Ok(ServerCertVerified::assertion()),
-            _ => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)),
+        if self.is_pinned(end_entity) {
+            return Ok(ServerCertVerified::assertion());
         }
+        self.webpki.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOfferedOrEnabled))
+        // Pinned relays speak TLS 1.3 only; TLS 1.2 is for CA-issued certificates.
+        if self.is_pinned(cert) {
+            return Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOfferedOrEnabled));
+        }
+        self.webpki.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -113,14 +129,15 @@ impl ServerCertVerifier for PinnedVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
+        self.webpki.supported_verify_schemes()
     }
 }
 
-/// iroh's relay TLS settings: trust only the pinned anchors.
+/// iroh's relay TLS settings: pinned relay keys, or else the usual CA roots.
 pub fn ca_tls_config(pinned: Pinned) -> iroh::tls::CaTlsConfig {
     iroh::tls::CaTlsConfig::custom_server_cert_verifier(Arc::new(move |provider| {
-        Ok(Arc::new(PinnedVerifier::new(pinned.clone(), provider)) as Arc<dyn ServerCertVerifier>)
+        let v = PinnedVerifier::new(pinned.clone(), provider).map_err(std::io::Error::other)?;
+        Ok(Arc::new(v) as Arc<dyn ServerCertVerifier>)
     }))
 }
 
@@ -131,16 +148,21 @@ mod tests {
     #[test]
     fn anchor_cert_carries_anchor_key() {
         let sk = SecretKey::generate();
-        let (cert, _) = anchor_cert(&sk).unwrap();
+        let (cert, _) = relay_cert(&sk).unwrap();
         assert_eq!(cert_key(&cert), Some(sk.public()));
-        anchor_server_config(&sk).unwrap();
+        relay_server_config(&sk).unwrap();
     }
 
     #[test]
-    fn verifier_rejects_unpinned_key() {
-        let (cert, _) = anchor_cert(&SecretKey::generate()).unwrap();
-        let v = PinnedVerifier::new(Arc::new(RwLock::new(vec![SecretKey::generate().public()])), provider());
+    fn verifier_accepts_pinned_and_rejects_unpinned_self_signed() {
+        let sk = SecretKey::generate();
+        let (cert, _) = relay_cert(&sk).unwrap();
         let name = ServerName::try_from("wired-anchor").unwrap();
-        assert!(v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_err());
+        let other =
+            PinnedVerifier::new(Arc::new(RwLock::new(vec![SecretKey::generate().public()])), provider()).unwrap();
+        // Not pinned, and not CA-issued either.
+        assert!(other.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_err());
+        let pinned = PinnedVerifier::new(Arc::new(RwLock::new(vec![sk.public()])), provider()).unwrap();
+        assert!(pinned.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());
     }
 }

@@ -46,6 +46,12 @@ pub struct JoinOptions {
     pub state_dir: Option<String>,
     #[uniffi(default = false)]
     pub ephemeral: bool,
+    /// Serve a relay behind a TLS-terminating proxy, reached at this URL. Needs `relay_bind`.
+    #[uniffi(default = None)]
+    pub relay_url: Option<String>,
+    /// Local address the relay listens on, e.g. `127.0.0.1:8790`.
+    #[uniffi(default = None)]
+    pub relay_bind: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -66,10 +72,36 @@ pub struct AnchorOptions {
     /// Run as a replica of the network this invite is for.
     #[uniffi(default = None)]
     pub replica_of: Option<String>,
+    /// Don't serve a relay (this machine isn't reachable from the internet).
+    #[uniffi(default = false)]
+    pub no_relay: bool,
+    /// Serve the relay behind a TLS-terminating proxy at this URL instead. Needs `relay_bind`.
+    #[uniffi(default = None)]
+    pub relay_url: Option<String>,
+    #[uniffi(default = None)]
+    pub relay_bind: Option<String>,
     #[uniffi(default = None)]
     pub state_dir: Option<String>,
     #[uniffi(default = false)]
     pub ephemeral: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct RelayEntry {
+    pub url: String,
+    pub pinned: bool,
+}
+
+fn behind_proxy(url: Option<String>, bind: Option<String>) -> Res<Option<wired::RelayServe>> {
+    match (url, bind) {
+        (Some(url), Some(bind)) => {
+            let bind =
+                bind.parse().map_err(|e: std::net::AddrParseError| WiredError::Failed { message: e.to_string() })?;
+            Ok(Some(wired::RelayServe::BehindProxy { bind, url }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(WiredError::Failed { message: "relay_url and relay_bind go together".into() }),
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -96,6 +128,9 @@ pub async fn join(options: JoinOptions) -> Res<Arc<WiredNode>> {
     if let Some(inv) = options.invite {
         b = b.invite(inv.parse()?);
     }
+    if let Some(serve) = behind_proxy(options.relay_url, options.relay_bind)? {
+        b = b.relay(serve);
+    }
     let node = common(b, options.state_dir, options.ephemeral).spawn().await?;
     Ok(Arc::new(WiredNode { node }))
 }
@@ -111,12 +146,22 @@ pub async fn anchor(options: AnchorOptions) -> Res<Arc<WiredNode>> {
         .map_err(|e: std::net::AddrParseError| WiredError::Failed { message: e.to_string() })?;
     let cfg = wired::AnchorConfig {
         bind: SocketAddr::new(host, options.port),
-        relay_bind: SocketAddr::new(host, options.port),
-        qad_bind: (!options.no_qad).then(|| SocketAddr::new(host, options.qad_port)),
-        public_host: options.public_host,
+        public_host: options.public_host.clone(),
         replica_of: options.replica_of.map(|i| i.parse()).transpose()?,
     };
-    let b = wired::Node::builder(options.name).anchor(cfg);
+    let serve = match (behind_proxy(options.relay_url, options.relay_bind)?, options.no_relay) {
+        (Some(s), _) => Some(s),
+        (None, true) => None,
+        (None, false) => Some(wired::RelayServe::Public {
+            bind: SocketAddr::new(host, options.port),
+            qad_bind: (!options.no_qad).then(|| SocketAddr::new(host, options.qad_port)),
+            public_host: options.public_host,
+        }),
+    };
+    let mut b = wired::Node::builder(options.name).anchor(cfg);
+    if let Some(s) = serve {
+        b = b.relay(s);
+    }
     let node = common(b, options.state_dir, options.ephemeral).spawn().await?;
     Ok(Arc::new(WiredNode { node }))
 }
@@ -155,6 +200,20 @@ impl WiredNode {
             .into_iter()
             .map(|m| MemberInfo { name: m.name, id: m.id.to_string(), anchor: m.anchor })
             .collect()
+    }
+
+    pub fn relays(&self) -> Vec<RelayEntry> {
+        self.node.relays().into_iter().map(|r| RelayEntry { url: r.url, pinned: r.pin.is_some() }).collect()
+    }
+
+    /// Root only: lists a relay (e.g. `https://robin.exe.xyz`) for the whole network.
+    pub fn add_relay(&self, url: String) -> Res<()> {
+        Ok(self.node.add_relay(&url)?)
+    }
+
+    /// Root only: stops listing a relay.
+    pub fn remove_relay(&self, url: String) -> Res<()> {
+        Ok(self.node.remove_relay(&url)?)
     }
 
     /// Root only: removes a node now; returns the new invite.

@@ -38,6 +38,10 @@ type JoinOptions struct {
 	StateDir string
 	// Ephemeral keeps keys in memory only.
 	Ephemeral bool
+	// RelayURL and RelayBind serve a relay behind a TLS-terminating proxy:
+	// clients reach it at RelayURL (e.g. https://robin.exe.xyz), and the proxy
+	// forwards /relay and /ping there to RelayBind (e.g. 127.0.0.1:8790).
+	RelayURL, RelayBind string
 }
 
 // AnchorOptions configures an anchor, which runs on a publicly reachable host.
@@ -58,8 +62,12 @@ type AnchorOptions struct {
 	// ReplicaOf makes this a replica of the network with this invite. Approve
 	// it on the root anchor with ApproveAnchor (or `wired approve <id>`).
 	ReplicaOf string
-	StateDir  string
-	Ephemeral bool
+	// NoRelay: don't serve a relay (the machine isn't reachable from the internet).
+	NoRelay bool
+	// RelayURL and RelayBind serve the relay behind a TLS-terminating proxy instead.
+	RelayURL, RelayBind string
+	StateDir            string
+	Ephemeral           bool
 }
 
 // Node is an embedded Wired node. Safe for concurrent use.
@@ -73,13 +81,15 @@ var ErrClosed = errors.New("wired: closed")
 
 // Join joins a network as a member.
 func Join(o JoinOptions) (*Node, error) {
-	name, inv, dir := cstr(o.Name), cstr(o.Invite), cstr(o.StateDir)
+	name, inv, dir, rurl, rbind := cstr(o.Name), cstr(o.Invite), cstr(o.StateDir), cstr(o.RelayURL), cstr(o.RelayBind)
 	defer freeC(name)
 	defer freeC(inv)
 	defer freeC(dir)
+	defer freeC(rurl)
+	defer freeC(rbind)
 	var p *C.WiredNode
 	var cerr *C.char
-	if C.wired_join(name, inv, dir, cbool(o.Ephemeral), &p, &cerr) != 0 {
+	if C.wired_join(name, inv, dir, cbool(o.Ephemeral), rurl, rbind, &p, &cerr) != 0 {
 		return nil, takeErr(cerr)
 	}
 	return &Node{p: p}, nil
@@ -101,14 +111,17 @@ func Anchor(o AnchorOptions) (*Node, error) {
 		qad = -1
 	}
 	name, host, pub, rep, dir := cstr(o.Name), cstr(o.BindHost), cstr(o.PublicHost), cstr(o.ReplicaOf), cstr(o.StateDir)
+	rurl, rbind := cstr(o.RelayURL), cstr(o.RelayBind)
 	defer freeC(name)
 	defer freeC(host)
 	defer freeC(pub)
 	defer freeC(rep)
 	defer freeC(dir)
+	defer freeC(rurl)
+	defer freeC(rbind)
 	var p *C.WiredNode
 	var cerr *C.char
-	if C.wired_anchor(name, host, port, qad, pub, rep, dir, cbool(o.Ephemeral), &p, &cerr) != 0 {
+	if C.wired_anchor(name, host, port, qad, pub, rep, cbool(o.NoRelay), rurl, rbind, dir, cbool(o.Ephemeral), &p, &cerr) != 0 {
 		return nil, takeErr(cerr)
 	}
 	return &Node{p: p}, nil
@@ -204,6 +217,49 @@ func (n *Node) inviteCall(f func(*C.WiredNode, **C.char, **C.char) C.int) (strin
 		return "", takeErr(cerr)
 	}
 	return goString(out), nil
+}
+
+// Relay is one of the network's relays.
+type Relay struct {
+	URL string
+	// Pinned: its certificate is pinned to a key (a self-signed relay) rather than CA-checked.
+	Pinned bool
+}
+
+// Relays lists the network's relays, as last synced from an anchor.
+func (n *Node) Relays() []Relay {
+	var out []Relay
+	for _, line := range strings.Split(n.str(func(p *C.WiredNode) *C.char { return C.wired_relays(p) }), "\n") {
+		if f := strings.Split(line, "\t"); len(f) == 2 {
+			out = append(out, Relay{URL: f[0], Pinned: f[1] == "pinned"})
+		}
+	}
+	return out
+}
+
+// AddRelay lists a relay (e.g. https://robin.exe.xyz) for the whole network (root only).
+func (n *Node) AddRelay(url string) error {
+	return n.urlCall(url, func(p *C.WiredNode, u *C.char, cerr **C.char) C.int { return C.wired_add_relay(p, u, cerr) })
+}
+
+// RemoveRelay stops listing a relay (root only).
+func (n *Node) RemoveRelay(url string) error {
+	return n.urlCall(url, func(p *C.WiredNode, u *C.char, cerr **C.char) C.int { return C.wired_remove_relay(p, u, cerr) })
+}
+
+func (n *Node) urlCall(url string, f func(*C.WiredNode, *C.char, **C.char) C.int) error {
+	p, done, err := n.handle()
+	if err != nil {
+		return err
+	}
+	defer done()
+	cu := cstr(url)
+	defer freeC(cu)
+	var cerr *C.char
+	if f(p, cu, &cerr) != 0 {
+		return takeErr(cerr)
+	}
+	return nil
 }
 
 // ApproveAnchor lets the replica anchor with this node id join (root only).

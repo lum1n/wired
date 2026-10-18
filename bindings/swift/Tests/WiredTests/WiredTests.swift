@@ -85,3 +85,12 @@ private func localAnchor() async throws -> WiredNode {
     await b.close()
     await vps.close()
 }
+
+@Test func addAndRemoveRelay() async throws {
+    let vps = try await localAnchor()
+    try vps.addRelay(url: "https://relay.example.com")
+    #expect(vps.relays().contains { $0.url == "https://relay.example.com" && !$0.pinned })
+    try vps.removeRelay(url: "https://relay.example.com")
+    #expect(throws: WiredError.self) { try vps.addRelay(url: "ftp://nope") }
+    await vps.close()
+}

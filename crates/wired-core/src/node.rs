@@ -16,7 +16,6 @@ use iroh::{
     address_lookup::MemoryLookup,
     endpoint::{Connection, NetReportConfig, RecvStream, SendStream, presets},
 };
-use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -28,26 +27,26 @@ use tracing::{info, warn};
 use crate::{
     anchor::AnchorState,
     cert,
-    invite::{AnchorInfo, Invite, NetworkSecret},
+    invite::{AnchorInfo, Invite, NetworkSecret, RelayInfo},
     peer::is_fatal,
     proto::{ALPN, Cert, Role, Snapshot},
+    relay::{self, RelayServe, ServedRelay},
     state::{self, AnchorDisk, MemberDisk},
     tls,
 };
 
 const DEFAULT_PORT: u16 = 7443;
-const DEFAULT_QAD_PORT: u16 = 7842;
 
-/// Settings for running a node as an anchor (on a publicly reachable host).
+/// Settings for running a node as an anchor. An anchor holds authority (the
+/// root key, or a replica of the network state); it does not need to be
+/// reachable from the internet. Reachability comes from relays (see
+/// [`Builder::relay`]), which any node can serve.
 #[derive(Debug, Clone)]
 pub struct AnchorConfig {
     /// UDP socket for peer QUIC traffic.
     pub bind: SocketAddr,
-    /// TCP socket for the HTTPS relay.
-    pub relay_bind: SocketAddr,
-    /// UDP socket for QUIC address discovery; `None` disables it.
-    pub qad_bind: Option<SocketAddr>,
-    /// Host name or IP put in the invite. Detected from the default route if unset.
+    /// Host name or IP others can use to reach `bind` directly, if any.
+    /// Detected from the default route if unset.
     pub public_host: Option<String>,
     /// Run as a replica of the network this invite is for. Its key must be
     /// approved on the root anchor (`wired approve <id>`) before it serves.
@@ -56,11 +55,8 @@ pub struct AnchorConfig {
 
 impl Default for AnchorConfig {
     fn default() -> Self {
-        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         Self {
-            bind: SocketAddr::new(any, DEFAULT_PORT),
-            relay_bind: SocketAddr::new(any, DEFAULT_PORT),
-            qad_bind: Some(SocketAddr::new(any, DEFAULT_QAD_PORT)),
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
             public_host: None,
             replica_of: None,
         }
@@ -77,6 +73,7 @@ pub struct Builder {
     state_dir: Option<PathBuf>,
     ephemeral: bool,
     relay_only: bool,
+    relay: Option<RelayServe>,
 }
 
 impl Builder {
@@ -86,9 +83,16 @@ impl Builder {
         self
     }
 
-    /// Run as an anchor: serve the relay, admit members, replicate network state.
+    /// Run as an anchor: admit members, own (root) or replicate the network state.
     pub fn anchor(mut self, config: AnchorConfig) -> Self {
         self.anchor = Some(config);
+        self
+    }
+
+    /// Serve a relay for the network. A member's relay is listed once it
+    /// joins; to join *through* it, add it on the root first (`add_relay`).
+    pub fn relay(mut self, serve: RelayServe) -> Self {
+        self.relay = Some(serve);
         self
     }
 
@@ -183,6 +187,11 @@ pub struct Node {
 }
 
 pub(crate) struct Inner {
+    /// Ourselves, for spawning work from `&self` methods.
+    pub(crate) me: Weak<Inner>,
+    /// The runtime the node was started on. Sync API calls (from JS, cgo or
+    /// Swift threads) spawn through it, since they have no runtime of their own.
+    pub(crate) rt: tokio::runtime::Handle,
     pub(crate) name: String,
     pub(crate) ep: Endpoint,
     pub(crate) network_id: [u8; 16],
@@ -197,10 +206,12 @@ pub(crate) struct Inner {
     pub(crate) services: Mutex<HashMap<String, Service>>,
     pub(crate) peers: Mutex<HashMap<PublicKey, Peer>>,
     pub(crate) anchor: Option<AnchorState>,
+    /// The relay this node serves, if any.
+    pub(crate) relay: Option<ServedRelay>,
     pub(crate) lookup: MemoryLookup,
     pub(crate) pinned: tls::Pinned,
-    /// Anchors whose relay is configured and whose TLS key is pinned.
-    pub(crate) known_anchors: Mutex<BTreeSet<[u8; 32]>>,
+    /// Relay URLs the endpoint is configured with.
+    pub(crate) known_relays: Mutex<BTreeSet<String>>,
     pub(crate) dir: Option<PathBuf>,
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -275,6 +286,17 @@ impl Node {
         self.inner.is_root()
     }
 
+    /// The network's relays, as last synced from an anchor.
+    pub fn relays(&self) -> Vec<RelayInfo> {
+        self.inner.snapshot().relays.clone()
+    }
+
+    /// The relay this node serves: its public URL and the local address it
+    /// listens on (for `BehindProxy`, where the proxy should forward to).
+    pub fn served_relay(&self) -> Option<(String, SocketAddr)> {
+        self.inner.relay.as_ref().map(|r| (r.info.url.clone(), r.local_addr))
+    }
+
     /// Every member of the network, as last synced from an anchor.
     pub fn members(&self) -> Vec<Member> {
         let snap = self.inner.snap.read().unwrap().clone();
@@ -329,7 +351,7 @@ impl Node {
 
     /// Forward streams for `service` to a local TCP address, e.g. an existing HTTP server.
     pub fn expose(&self, service: &str, target: impl Into<String>) -> Result<Task> {
-        Ok(spawn_expose(self.listen(service)?, target.into()))
+        Ok(spawn_expose(&self.inner.rt, self.listen(service)?, target.into()))
     }
 
     /// Like [`Node::expose`], but only the named nodes may connect.
@@ -338,7 +360,7 @@ impl Node {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Ok(spawn_expose(self.listen_allow(service, allow)?, target.into()))
+        Ok(spawn_expose(&self.inner.rt, self.listen_allow(service, allow)?, target.into()))
     }
 
     /// Listen on a local TCP address and forward each connection to `target` (`service@node`).
@@ -386,8 +408,8 @@ impl Node {
     }
 }
 
-fn spawn_expose(mut ln: Listener, target: String) -> Task {
-    let handle = tokio::spawn(async move {
+fn spawn_expose(rt: &tokio::runtime::Handle, mut ln: Listener, target: String) -> Task {
+    let handle = rt.spawn(async move {
         while let Some(mut stream) = ln.accept().await {
             let target = target.clone();
             tokio::spawn(async move {
@@ -492,7 +514,7 @@ impl AsyncWrite for Stream {
 
 impl Inner {
     pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        self.tasks.lock().unwrap().push(tokio::spawn(fut));
+        self.tasks.lock().unwrap().push(self.rt.spawn(fut));
     }
 
     pub(crate) fn is_root(&self) -> bool {
@@ -505,7 +527,13 @@ impl Inner {
 
     pub(crate) fn invite(&self) -> Invite {
         let snap = self.snapshot();
-        Invite::new(self.network_id, *self.root.as_bytes(), self.secret.read().unwrap().clone(), snap.anchors.clone())
+        Invite::new(
+            self.network_id,
+            *self.root.as_bytes(),
+            self.secret.read().unwrap().clone(),
+            snap.anchors.clone(),
+            snap.relays.clone(),
+        )
     }
 
     /// Writes what this node needs to restart (and, on the root, the invite).
@@ -538,28 +566,68 @@ impl Inner {
         }
     }
 
-    /// Configures relays, pinning and addresses for anchors we have not seen yet,
-    /// and refreshes addresses for the rest.
-    pub(crate) async fn learn_anchors(&self, anchors: &[AnchorInfo]) {
-        for a in anchors {
-            let (Ok(id), Ok(url)) = (PublicKey::from_bytes(&a.id), a.relay_url.parse::<RelayUrl>()) else {
-                warn!("ignoring malformed anchor entry");
-                continue;
-            };
-            if self.known_anchors.lock().unwrap().insert(a.id) {
-                self.pinned.write().unwrap().push(id);
-                let config = iroh::RelayConfig::new(url.clone(), a.qad_port.map(iroh_relay::RelayQuicConfig::new));
-                self.ep.insert_relay(url.clone(), Arc::new(config)).await;
+    /// Brings the endpoint in line with the network: connects to new relays,
+    /// drops removed ones (never our own), and refreshes anchor addresses.
+    pub(crate) async fn learn_network(&self, snap: &Snapshot) {
+        let own = self.relay.as_ref().map(|r| norm_url(&r.info.url));
+        let (add, remove) = {
+            let mut known = self.known_relays.lock().unwrap();
+            let want: BTreeSet<String> = snap.relays.iter().map(|r| norm_url(&r.url)).chain(own.clone()).collect();
+            let add: Vec<RelayInfo> = snap.relays.iter().filter(|r| known.insert(norm_url(&r.url))).cloned().collect();
+            let remove: Vec<String> = known.iter().filter(|u| !want.contains(*u)).cloned().collect();
+            for u in &remove {
+                known.remove(u);
             }
-            if id != self.ep.id() {
-                self.lookup.add_endpoint_info(anchor_addr(id, url, &a.addrs).await);
+            (add, remove)
+        };
+        let token = relay::token(&self.network_id);
+        for r in add {
+            if let Some(pin) = r.pin.and_then(|p| PublicKey::from_bytes(&p).ok()) {
+                self.pinned.write().unwrap().push(pin);
+            }
+            match relay_config(&r, &token) {
+                Ok(config) => {
+                    self.ep.insert_relay(config.url.clone(), Arc::new(config)).await;
+                }
+                Err(e) => warn!(url = %r.url, "ignoring relay: {e:#}"),
+            }
+        }
+        for u in remove {
+            if let Ok(url) = u.parse::<RelayUrl>() {
+                self.ep.remove_relay(&url).await;
+            }
+        }
+        let relays = relay_urls(snap);
+        for a in &snap.anchors {
+            if let Ok(id) = PublicKey::from_bytes(&a.id)
+                && id != self.ep.id()
+            {
+                self.lookup.add_endpoint_info(anchor_addr(id, &relays, &a.addrs).await);
             }
         }
     }
+
+    /// Relay URLs to reach a peer through: every relay in the network.
+    pub(crate) fn relay_urls(&self) -> Vec<RelayUrl> {
+        relay_urls(&self.snapshot())
+    }
 }
 
-async fn anchor_addr(id: PublicKey, relay: RelayUrl, hosts: &[String]) -> EndpointAddr {
-    let mut addr = EndpointAddr::new(id).with_relay_url(relay);
+fn norm_url(u: &str) -> String {
+    u.trim_end_matches('/').to_string()
+}
+
+fn relay_urls(snap: &Snapshot) -> Vec<RelayUrl> {
+    snap.relays.iter().filter_map(|r| r.url.parse().ok()).collect()
+}
+
+fn relay_config(r: &RelayInfo, token: &str) -> Result<iroh::RelayConfig> {
+    let url: RelayUrl = r.url.parse().with_context(|| format!("bad relay url {}", r.url))?;
+    Ok(iroh::RelayConfig::new(url, r.qad_port.map(iroh_relay::RelayQuicConfig::new)).with_auth_token(token))
+}
+
+async fn anchor_addr(id: PublicKey, relays: &[RelayUrl], hosts: &[String]) -> EndpointAddr {
+    let mut addr = EndpointAddr::from_parts(id, relays.iter().cloned().map(iroh::TransportAddr::Relay));
     for host in hosts {
         match tokio::net::lookup_host(host).await {
             Ok(ips) => {
@@ -576,21 +644,11 @@ async fn anchor_addr(id: PublicKey, relay: RelayUrl, hosts: &[String]) -> Endpoi
 // ---------------------------------------------------------------------------
 // Startup
 
-fn relay_map(anchors: &[AnchorInfo]) -> Result<RelayMap> {
-    anchors
-        .iter()
-        .map(|a| {
-            let url: RelayUrl = a.relay_url.parse().with_context(|| format!("bad relay url {}", a.relay_url))?;
-            Ok(iroh::RelayConfig::new(url, a.qad_port.map(iroh_relay::RelayQuicConfig::new)))
-        })
-        .collect()
-}
-
-/// Anchors from `extra` that are not already in `base`, appended.
-fn merge_anchors(mut base: Vec<AnchorInfo>, extra: &[AnchorInfo]) -> Vec<AnchorInfo> {
-    for a in extra {
-        if !base.iter().any(|b| b.id == a.id) {
-            base.push(a.clone());
+/// `extra` entries whose key `key` is not already in `base`, appended.
+fn merge<T: Clone, K: PartialEq>(mut base: Vec<T>, extra: &[T], key: impl Fn(&T) -> K) -> Vec<T> {
+    for e in extra {
+        if !base.iter().any(|b| key(b) == key(e)) {
+            base.push(e.clone());
         }
     }
     base
@@ -600,28 +658,28 @@ struct Bound {
     ep: Endpoint,
     lookup: MemoryLookup,
     pinned: tls::Pinned,
-    known: BTreeSet<[u8; 32]>,
+    known: BTreeSet<String>,
 }
 
 async fn bind_endpoint(
     key: SecretKey,
-    anchors: &[AnchorInfo],
+    network_id: &[u8; 16],
+    relays: &[RelayInfo],
     bind: Option<SocketAddr>,
     relay_only: bool,
 ) -> Result<Bound> {
-    let ids = anchors
-        .iter()
-        .map(|a| PublicKey::from_bytes(&a.id).map_err(|e| anyhow!("bad anchor id: {e}")))
-        .collect::<Result<Vec<_>>>()?;
-    let pinned: tls::Pinned = Arc::new(RwLock::new(ids));
+    let pins = relays.iter().filter_map(|r| r.pin.and_then(|p| PublicKey::from_bytes(&p).ok())).collect();
+    let pinned: tls::Pinned = Arc::new(RwLock::new(pins));
+    let token = relay::token(network_id);
+    let map: RelayMap = relays.iter().map(|r| relay_config(r, &token)).collect::<Result<_>>()?;
     let lookup = MemoryLookup::new();
     let mut net_report = NetReportConfig::default();
-    // Anchors only serve the relay over HTTPS; there is no `/generate_204` to probe.
+    // Relays behind proxies serve only `/relay` and `/ping`; no `/generate_204`.
     net_report.captive_portal_check = false;
     let mut b = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Custom(relay_map(anchors)?))
+        .relay_mode(RelayMode::Custom(map))
         .ca_tls_config(tls::ca_tls_config(pinned.clone()))
         .net_report_config(net_report)
         .address_lookup(lookup.clone());
@@ -631,7 +689,7 @@ async fn bind_endpoint(
         b = b.clear_ip_transports();
     }
     let ep = b.bind().await?;
-    Ok(Bound { ep, lookup, pinned, known: anchors.iter().map(|a| a.id).collect() })
+    Ok(Bound { ep, lookup, pinned, known: relays.iter().map(|r| norm_url(&r.url)).collect() })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,9 +702,12 @@ fn new_inner(
     cert: Option<Cert>,
     snap: Snapshot,
     anchor: Option<AnchorState>,
+    relay: Option<ServedRelay>,
     dir: Option<PathBuf>,
 ) -> Arc<Inner> {
-    Arc::new(Inner {
+    Arc::new_cyclic(|me| Inner {
+        me: me.clone(),
+        rt: tokio::runtime::Handle::current(),
         name,
         ep: bound.ep,
         network_id,
@@ -657,16 +718,24 @@ fn new_inner(
         services: Mutex::new(HashMap::new()),
         peers: Mutex::new(HashMap::new()),
         anchor,
+        relay,
         lookup: bound.lookup,
         pinned: bound.pinned,
-        known_anchors: Mutex::new(bound.known),
+        known_relays: Mutex::new(bound.known),
         dir,
         tasks: Mutex::new(Vec::new()),
     })
 }
 
+async fn start_relay(b: &Builder, key: &SecretKey, network_id: &[u8; 16]) -> Result<Option<ServedRelay>> {
+    match &b.relay {
+        Some(serve) => Ok(Some(relay::start(serve, key, network_id).await?)),
+        None => Ok(None),
+    }
+}
+
 async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Result<Node> {
-    let invite = match b.invite {
+    let invite = match b.invite.clone() {
         Some(i) => i,
         None => std::env::var("WIRED_INVITE").context("no invite given and WIRED_INVITE is not set")?.parse()?,
     };
@@ -680,12 +749,15 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
         Some(d) if d.cert.body.node_id == *key.public().as_bytes() => (Some(d.cert), d.snapshot),
         _ => (None, Snapshot::default()),
     };
-    snap.anchors = merge_anchors(snap.anchors, &invite.anchors);
+    snap.anchors = merge(snap.anchors, &invite.anchors, |a| a.id);
+    snap.relays = merge(snap.relays, &invite.relays, |r| norm_url(&r.url));
 
-    let bound = bind_endpoint(key, &snap.anchors, None, b.relay_only).await?;
-    let anchors = snap.anchors.clone();
-    let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, None, dir);
-    inner.learn_anchors(&anchors).await;
+    let relay = start_relay(&b, &key, &invite.network_id).await?;
+    let relays =
+        merge(snap.relays.clone(), &relay.iter().map(|r| r.info.clone()).collect::<Vec<_>>(), |r| norm_url(&r.url));
+    let bound = bind_endpoint(key, &invite.network_id, &relays, None, b.relay_only).await?;
+    let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, None, relay, dir);
+    inner.learn_network(&inner.snapshot()).await;
 
     match inner.open_session_any().await {
         Ok(session) => inner.spawn(inner.clone().control_loop(Some(session))),
@@ -716,44 +788,35 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         }
         (None, None) => (rand::random(), me, NetworkSecret::generate(), Snapshot::default(), BTreeSet::new(), None),
         (Some(inv), Some(d)) if d.network_id == inv.network_id && d.root == inv.root => {
-            let snap = Snapshot { anchors: merge_anchors(d.snapshot.anchors.clone(), &inv.anchors), ..d.snapshot };
+            let snap = Snapshot {
+                anchors: merge(d.snapshot.anchors.clone(), &inv.anchors, |a| a.id),
+                relays: merge(d.snapshot.relays.clone(), &inv.relays, |r| norm_url(&r.url)),
+                ..d.snapshot
+            };
             (d.network_id, d.root, d.secret, snap, BTreeSet::new(), d.cert)
         }
         (Some(inv), _) => {
             ensure!(inv.root != me, "a replica cannot use the root's key");
-            let snap = Snapshot { anchors: inv.anchors.clone(), ..Default::default() };
+            let snap = Snapshot { anchors: inv.anchors.clone(), relays: inv.relays.clone(), ..Default::default() };
             (inv.network_id, inv.root, inv.secret.clone(), snap, BTreeSet::new(), None)
         }
     };
     let root = PublicKey::from_bytes(&root).map_err(|e| anyhow!("bad root key: {e}"))?;
     let is_root = root == key.public();
 
-    let tls_config = tls::anchor_server_config(&key)?;
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new(cfg.relay_bind, CertConfig::Manual { server_config: tls_config.clone() }));
-    let mut server_config = ServerConfig::default();
-    server_config.relay = Some(relay);
-    server_config.quic = cfg.qad_bind.map(|addr| {
-        let mut q = QuicConfig::new(addr);
-        q.server_config = Some(tls_config);
-        q
-    });
-    let server = Server::spawn(server_config).await.context("start relay")?;
-    let https_port = server.https_addr().context("relay has no https address")?.port();
-    let qad_port = server.quic_addr().map(|a| a.port());
-
-    let host = match cfg.public_host.clone() {
-        Some(h) => h,
-        None => detect_host().await,
-    };
-    let url_host = if host.contains(':') { format!("[{host}]") } else { host.clone() };
-    let mut info =
-        AnchorInfo { id: me, relay_url: format!("https://{url_host}:{https_port}"), addrs: Vec::new(), qad_port };
-
-    let others: Vec<AnchorInfo> = snap.anchors.iter().filter(|a| a.id != me).cloned().collect();
-    let bound = bind_endpoint(key.clone(), &merge_anchors(vec![info.clone()], &others), Some(cfg.bind), false).await?;
-    let udp_port = bound.ep.bound_sockets().first().context("endpoint has no socket")?.port();
-    info.addrs.push(format!("{url_host}:{udp_port}"));
+    let relay = start_relay(&b, &key, &network_id).await?;
+    let own_relay: Vec<RelayInfo> = relay.iter().map(|r| r.info.clone()).collect();
+    let relays = merge(snap.relays.clone(), &own_relay, |r| norm_url(&r.url));
+    let bind = (!b.relay_only).then_some(cfg.bind);
+    let bound = bind_endpoint(key.clone(), &network_id, &relays, bind, b.relay_only).await?;
+    let mut info = AnchorInfo { id: me, addrs: Vec::new() };
+    if let Some(socket) = bound.ep.bound_sockets().first() {
+        let host = match cfg.public_host.clone() {
+            Some(h) => h,
+            None => detect_host().await,
+        };
+        info.addrs.push(format!("{}:{}", relay::url_host(&host), socket.port()));
+    }
 
     let mut snap = snap;
     let cert = if is_root {
@@ -762,12 +825,17 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         {
             bail!("name {:?} belongs to another key in this network", b.name);
         }
-        if snap.members.get(&b.name) != Some(&me) || !snap.anchors.contains(&info) {
-            snap.members.retain(|_, k| *k != me);
-            snap.members.insert(b.name.clone(), me);
-            snap.anchors.retain(|a| a.id != me);
-            snap.anchors.insert(0, info.clone());
-            snap.version += 1;
+        let mut next = snap.clone();
+        next.members.retain(|_, k| *k != me);
+        next.members.insert(b.name.clone(), me);
+        next.anchors.retain(|a| a.id != me);
+        next.anchors.insert(0, info.clone());
+        // Our own relay replaces whatever we served last time.
+        next.relays.retain(|r| r.owner != Some(me));
+        next.relays.extend(own_relay);
+        if next != snap {
+            next.version += 1;
+            snap = next;
         }
         Some(cert::issue(&key, None, network_id, key.public(), &b.name, Role::Anchor))
     } else {
@@ -775,10 +843,12 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     };
 
     let (updates, _) = watch::channel(Arc::new(snap.clone()));
-    let anchor = AnchorState { info, approved: Mutex::new(approved), updates, _relay: server };
-    let anchors = snap.anchors.clone();
-    let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, Some(anchor), dir.clone());
-    inner.learn_anchors(&anchors).await;
+    let anchor = AnchorState { info, approved: Mutex::new(approved), updates };
+    let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, Some(anchor), relay, dir.clone());
+    inner.learn_network(&inner.snapshot()).await;
+    if let Some(r) = &inner.relay {
+        *r.denied.write().unwrap() = inner.snapshot().denied.clone();
+    }
     inner.persist();
     inner.spawn(inner.clone().accept_loop());
 
@@ -804,7 +874,7 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
 }
 
 /// The IP of the interface holding the default route. Sends no packets.
-async fn detect_host() -> String {
+pub(crate) async fn detect_host() -> String {
     let probe = async {
         let sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         sock.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).await?;

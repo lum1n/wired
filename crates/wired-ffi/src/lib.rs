@@ -76,12 +76,26 @@ pub unsafe extern "C" fn wired_string_free(s: *mut c_char) {
     }
 }
 
+/// Serving a relay behind a TLS-terminating proxy, from optional `url` and `bind`.
+unsafe fn behind_proxy(url: *const c_char, bind: *const c_char) -> Result<Option<wired::RelayServe>> {
+    match (unsafe { opt_str(url) }?, unsafe { opt_str(bind) }?) {
+        (Some(url), Some(bind)) => {
+            Ok(Some(wired::RelayServe::BehindProxy { bind: bind.parse()?, url: url.to_string() }))
+        }
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("relay_url and relay_bind go together"),
+    }
+}
+
+/// `relay_url`/`relay_bind` (nullable): serve a relay behind a TLS-terminating proxy.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wired_join(
     name: *const c_char,
     invite: *const c_char,
     state_dir: *const c_char,
     ephemeral: c_int,
+    relay_url: *const c_char,
+    relay_bind: *const c_char,
     out: *mut *mut WiredNode,
     err: *mut *mut c_char,
 ) -> c_int {
@@ -90,6 +104,9 @@ pub unsafe extern "C" fn wired_join(
         if let Some(inv) = unsafe { opt_str(invite) }? {
             b = b.invite(inv.parse()?);
         }
+        if let Some(serve) = unsafe { behind_proxy(relay_url, relay_bind) }? {
+            b = b.relay(serve);
+        }
         let b = common(b, unsafe { opt_str(state_dir) }?, ephemeral);
         let node = RT.block_on(b.spawn())?;
         unsafe { *out = Box::into_raw(Box::new(WiredNode { node })) };
@@ -97,8 +114,10 @@ pub unsafe extern "C" fn wired_join(
     })
 }
 
-/// `qad_port < 0` disables QUIC address discovery. `replica_of` (nullable) is
-/// the invite of the network to replicate.
+/// Starts an anchor. Its relay: behind a proxy when `relay_url`/`relay_bind`
+/// are set; none when `no_relay`; otherwise public on `port` (with QUIC
+/// address discovery on `qad_port`, which `< 0` disables). `replica_of`
+/// (nullable) is the invite of the network to replicate.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wired_anchor(
     name: *const c_char,
@@ -107,6 +126,9 @@ pub unsafe extern "C" fn wired_anchor(
     qad_port: i32,
     public_host: *const c_char,
     replica_of: *const c_char,
+    no_relay: c_int,
+    relay_url: *const c_char,
+    relay_bind: *const c_char,
     state_dir: *const c_char,
     ephemeral: c_int,
     out: *mut *mut WiredNode,
@@ -114,18 +136,28 @@ pub unsafe extern "C" fn wired_anchor(
 ) -> c_int {
     ffi(err, || {
         let host: IpAddr = unsafe { opt_str(bind_host) }?.unwrap_or("0.0.0.0").parse()?;
-        let qad = match qad_port {
-            p if p < 0 => None,
-            p => Some(SocketAddr::new(host, u16::try_from(p).context("qad port out of range")?)),
-        };
+        let public_host = unsafe { opt_str(public_host) }?.map(str::to_string);
         let cfg = wired::AnchorConfig {
             bind: SocketAddr::new(host, port),
-            relay_bind: SocketAddr::new(host, port),
-            qad_bind: qad,
-            public_host: unsafe { opt_str(public_host) }?.map(str::to_string),
+            public_host: public_host.clone(),
             replica_of: unsafe { opt_str(replica_of) }?.map(str::parse).transpose()?,
         };
-        let b = wired::Node::builder(unsafe { req_str(name, "name") }?).anchor(cfg);
+        let serve = match (unsafe { behind_proxy(relay_url, relay_bind) }?, no_relay != 0) {
+            (Some(s), _) => Some(s),
+            (None, true) => None,
+            (None, false) => Some(wired::RelayServe::Public {
+                bind: SocketAddr::new(host, port),
+                qad_bind: match qad_port {
+                    p if p < 0 => None,
+                    p => Some(SocketAddr::new(host, u16::try_from(p).context("qad port out of range")?)),
+                },
+                public_host,
+            }),
+        };
+        let mut b = wired::Node::builder(unsafe { req_str(name, "name") }?).anchor(cfg);
+        if let Some(s) = serve {
+            b = b.relay(s);
+        }
         let b = common(b, unsafe { opt_str(state_dir) }?, ephemeral);
         let node = RT.block_on(b.spawn())?;
         unsafe { *out = Box::into_raw(Box::new(WiredNode { node })) };
@@ -311,6 +343,30 @@ pub unsafe extern "C" fn wired_rotate_invite(
         unsafe { *invite = c_string(new) };
         Ok(())
     })
+}
+
+/// One relay per line: `url<TAB>pinned|ca`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wired_relays(n: *const WiredNode) -> *mut c_char {
+    let lines: String = unsafe { &*n }
+        .node
+        .relays()
+        .iter()
+        .map(|r| format!("{}\t{}\n", r.url, if r.pin.is_some() { "pinned" } else { "ca" }))
+        .collect();
+    c_string(lines)
+}
+
+/// Root only: lists a relay (e.g. `https://robin.exe.xyz`) for the whole network.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wired_add_relay(n: *const WiredNode, url: *const c_char, err: *mut *mut c_char) -> c_int {
+    ffi(err, || unsafe { &*n }.node.add_relay(unsafe { req_str(url, "url") }?))
+}
+
+/// Root only: stops listing a relay.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wired_remove_relay(n: *const WiredNode, url: *const c_char, err: *mut *mut c_char) -> c_int {
+    ffi(err, || unsafe { &*n }.node.remove_relay(unsafe { req_str(url, "url") }?))
 }
 
 /// Root only: lets the replica anchor with this id join.

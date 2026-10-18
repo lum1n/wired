@@ -6,13 +6,32 @@ This document is normative for every Wired implementation and binding.
 
 - Every node is an iroh endpoint. Its identity is an Ed25519 key, and its endpoint id is the public key.
 - Connections are QUIC with TLS 1.3, authenticated by raw public keys, using ALPN `wired/1`.
-- NAT traversal (hole punching) and relay fallback are iroh's job. The only relays are the ones served by the network's anchors. No third-party relays or discovery services are used.
-- Each anchor's relay serves HTTPS and QUIC address discovery with a self-signed certificate made from the anchor's key. Clients accept a relay certificate only if its key belongs to a known anchor.
+- NAT traversal (hole punching) and relay fallback are iroh's job. The only relays are the ones listed in the network state. No third-party relays or discovery services are used.
+
+## Relays
+
+- Relays are how nodes on different networks find each other, and what traffic falls back to when NAT traversal fails.
+- They hold no keys and only ever see ciphertext.
+- Any node can serve one. Nodes connect to every listed relay as needed.
+
+A relay is listed as `RelayInfo { url, pin, qad_port, owner }`. There are two kinds:
+- **Public:** on a reachable host. HTTPS uses a self-signed certificate made from the serving node's key. `pin` is that key, and clients accept the certificate only if it carries it. QUIC address discovery runs on `qad_port`.
+- **Behind a proxy:** a TLS-terminating proxy (exe.dev, nginx, Caddy) forwards `/relay` (a WebSocket) and `/ping` at the root of `url` to the relay's plain-HTTP socket. `pin` is `None`, so clients check the certificate against the usual CA roots. There is no address discovery.
+
+**Access.** Relays admit a client only when both hold:
+- it presents `Authorization: Bearer T`, where `T = hex(SHA-256("wired/1 relay-token" ‖ network_id)[..16])`;
+- its key is not denied.
+
+The token keeps strangers off the relay's bandwidth; it is not what protects traffic.
+
+**Listing.** A relay gets into the network in one of two ways:
+- The root adds it (`add_relay`). This is needed to bootstrap: a node can only join through a relay that the root is already connected to.
+- A node that serves one announces it in `Join`, and the root records it with that node as `owner`. Revoking the owner removes its relays.
 
 ## Roles
 
-- **Root anchor.** It creates the network. Its key is the trust anchor, and it is the only place where the network's state can change: new keys, revocations, and anchor approvals.
-- **Replica anchors.** They are approved by the root. They serve a relay, renew certificates for keys the network already knows, and push the network state to members.
+- **Root anchor.** It creates the network. Its key is the trust anchor, and it is the only place where the network's state can change: new keys, revocations, anchor approvals and relays. It needs no inbound reachability: it can sit behind NAT and reach everyone through relays.
+- **Replica anchors.** They are approved by the root. They renew certificates for keys the network already knows, and push the network state to members.
 - **Members.** Every other node.
 
 ## Network and invite
@@ -24,7 +43,8 @@ This document is normative for every Wired implementation and binding.
 - An invite string is `wired1` followed by lowercase RFC 4648 base32, without padding, of:
 
   ```
-  postcard(Invite { version: 1, network_id, root, secret: S, anchors: [AnchorInfo { id, relay_url, addrs, qad_port }] })
+  postcard(Invite { version: 1, network_id, root, secret: S,
+                    anchors: [AnchorInfo { id, addrs }], relays: [RelayInfo { url, pin, qad_port, owner }] })
   ‖ SHA-256(payload)[..4]
   ```
 
@@ -64,7 +84,7 @@ A certificate presented on a connection is valid when all of these hold:
 
 ## Joining and renewal
 
-The first stream a node opens to an anchor is `Open::Join { version, network_id, name, proof, anchor }`, where:
+The first stream a node opens to an anchor is `Open::Join { version, network_id, name, proof, anchor, relay }`, where:
 
 ```
 proof = HMAC-SHA256(S, "wired/1 join-proof" ‖ node_id ‖ E)
@@ -78,13 +98,14 @@ The anchor checks, in order:
    - **Registered key.** `name` must equal its registered name. No proof is needed: the TLS handshake proved possession of the key. Any anchor may renew it.
    - **New key.** It is accepted only at the root. `proof` must verify under the current `S`, compared in constant time, and `name` must be unclaimed. The root records the name and the key atomically.
 4. If `anchor` (an `AnchorInfo`) is present, the key must have been approved on the root. The root then records the key as an anchor and issues an anchor certificate.
+5. If `relay` (a `RelayInfo`) is present, the root lists that relay with the joining key as its owner.
 
 On success, the reply is `Reply::Joined { cert, anchor }`, where `anchor` is the answering anchor's own certificate. The joining node verifies both. Later `Join` streams on the same connection renew the certificate.
 
 ## Network state
 
 ```
-Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], secret }
+Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], relays: [RelayInfo], secret }
 ```
 
 - The root owns the snapshot and increments `version` on every change.
@@ -113,7 +134,7 @@ Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo],
 ## Revocation
 
 Revoking a node on the root does the following:
-1. Removes its name, adds its key to `denied`, removes it from `anchors` if present, and rotates `S`.
+1. Removes its name, adds its key to `denied`, removes it from `anchors` and any relays it owns, and rotates `S`.
 2. Publishes the new snapshot. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
 
 Existing members keep working. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
@@ -125,7 +146,7 @@ Limits:
 ## Replicas
 
 1. A replica starts with the network's invite. It is not trusted until an operator approves its key on the root (`wired approve <id>`).
-2. The replica then sends `Join` with its `AnchorInfo`, receives an anchor certificate, and keeps a Watch session to replicate the snapshot.
+2. The replica then sends `Join` with its `AnchorInfo` (and its `RelayInfo` if it serves one), receives an anchor certificate, and keeps a Watch session to replicate the snapshot.
 3. If the root is down, existing members renew at replicas, peers keep verifying each other's certificates (chains end at the root key), and names keep resolving. Only new joins, revocations and approvals wait for the root.
 
 ## Errors
@@ -147,5 +168,5 @@ Limits:
 ## Administration
 
 A running anchor listens on a Unix socket at `<state_dir>/anchor/admin.sock`. The socket has mode 0600 and sits in a 0700 directory.
-- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>` or `members`.
+- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>`, `members`, `relays`, `relay add <url>` or `relay remove <url>`.
 - **Response:** `ok` followed by the output, or `error: <message>`.

@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
-use wired::{AnchorConfig, Node, Task};
+use wired::{AnchorConfig, Node, RelayServe, Task};
 
 #[derive(Parser)]
 #[command(name = "wired", version, about = "Encrypted service-to-service networking")]
@@ -15,22 +15,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run an anchor on a publicly reachable host and print the network invite.
+    /// Run an anchor (the root, or a replica) and print the network invite.
+    ///
+    /// By default it also serves a relay on --port, which needs a public host.
+    /// Behind NAT, use --no-relay and add relays other nodes serve.
     Anchor {
         #[arg(long, default_value = "anchor")]
         name: String,
-        /// UDP port for peers and TCP port for the HTTPS relay.
+        /// UDP port for peers, and TCP port for the relay.
         #[arg(long, default_value_t = 7443)]
         port: u16,
-        /// UDP port for QUIC address discovery (0 disables it).
+        /// UDP port for the relay's QUIC address discovery (0 disables it).
         #[arg(long, default_value_t = 7842)]
         qad_port: u16,
-        /// Host name or IP to put in the invite (default: the default route's IP).
+        /// Host name or IP others reach this machine at (default: the default route's IP).
         #[arg(long)]
         public_host: Option<String>,
+        /// Don't serve a relay (this machine isn't reachable from the internet).
+        #[arg(long, conflicts_with = "relay_url")]
+        no_relay: bool,
         /// Run as a replica of this network (approve it on the root with `wired approve <id>`).
         #[arg(long, value_name = "INVITE", hide_env_values = true)]
         replica_of: Option<String>,
+        #[command(flatten)]
+        relay: RelayArgs,
         #[command(flatten)]
         common: Common,
     },
@@ -42,7 +50,19 @@ enum Cmd {
         #[arg(long, env = "WIRED_INVITE", hide_env_values = true)]
         invite: String,
         #[command(flatten)]
+        relay: RelayArgs,
+        #[command(flatten)]
         common: Common,
+    },
+    /// List the network's relays.
+    Relays {
+        #[command(flatten)]
+        admin: Admin,
+    },
+    /// Add or remove a relay (on the root).
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCmd,
     },
     /// Print the current invite of the anchor using this state directory.
     Invite {
@@ -71,6 +91,40 @@ enum Cmd {
         #[command(flatten)]
         admin: Admin,
     },
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// List a relay for the whole network, e.g. `https://robin.exe.xyz`.
+    Add {
+        url: String,
+        #[command(flatten)]
+        admin: Admin,
+    },
+    /// Stop listing a relay.
+    Remove {
+        url: String,
+        #[command(flatten)]
+        admin: Admin,
+    },
+}
+
+/// Serving a relay behind a proxy that terminates TLS (exe.dev, nginx, Caddy).
+#[derive(Args)]
+struct RelayArgs {
+    /// Serve a relay reached at this URL, e.g. `https://robin.exe.xyz`. The proxy
+    /// must forward `/relay` (WebSocket) and `/ping` there to --relay-bind.
+    #[arg(long, value_name = "URL", requires = "relay_bind")]
+    relay_url: Option<String>,
+    /// Local address the relay listens on, behind the proxy.
+    #[arg(long, value_name = "ADDR")]
+    relay_bind: Option<SocketAddr>,
+}
+
+impl RelayArgs {
+    fn serve(&self) -> Option<RelayServe> {
+        Some(RelayServe::BehindProxy { bind: self.relay_bind?, url: self.relay_url.clone()? })
+    }
 }
 
 /// Talks to a running anchor over its local admin socket.
@@ -121,6 +175,12 @@ async fn run(builder: wired::Builder, common: Common) -> Result<()> {
     };
     let node = builder.spawn().await?;
     eprintln!("wired: {} is up (id {})", node.name(), node.id());
+    if let Some((url, local)) = node.served_relay() {
+        eprintln!("wired: serving a relay at {url} (listening on {local})");
+    }
+    if node.relays().is_empty() {
+        eprintln!("wired: no relays yet; add one on the root with `wired relay add <url>`");
+    }
     if node.is_root() {
         eprintln!("wired: invite (treat it like a password):");
         println!("{}", node.invite());
@@ -173,18 +233,38 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().cmd {
-        Cmd::Anchor { name, port, qad_port, public_host, replica_of, common } => {
+        Cmd::Anchor { name, port, qad_port, public_host, no_relay, replica_of, relay, common } => {
             let any = |p| SocketAddr::from(([0, 0, 0, 0], p));
             let cfg = AnchorConfig {
                 bind: any(port),
-                relay_bind: any(port),
-                qad_bind: (qad_port != 0).then(|| any(qad_port)),
-                public_host,
+                public_host: public_host.clone(),
                 replica_of: replica_of.map(|i| i.parse()).transpose()?,
             };
-            run(Node::builder(name).anchor(cfg), common).await
+            let serve = match (relay.serve(), no_relay) {
+                (Some(s), _) => Some(s),
+                (None, true) => None,
+                (None, false) => Some(RelayServe::Public {
+                    bind: any(port),
+                    qad_bind: (qad_port != 0).then(|| any(qad_port)),
+                    public_host,
+                }),
+            };
+            let mut builder = Node::builder(name).anchor(cfg);
+            if let Some(s) = serve {
+                builder = builder.relay(s);
+            }
+            run(builder, common).await
         }
-        Cmd::Join { name, invite, common } => run(Node::builder(name).invite(invite.parse()?), common).await,
+        Cmd::Join { name, invite, relay, common } => {
+            let mut builder = Node::builder(name).invite(invite.parse()?);
+            if let Some(s) = relay.serve() {
+                builder = builder.relay(s);
+            }
+            run(builder, common).await
+        }
+        Cmd::Relays { admin } => admin.run("relays").await,
+        Cmd::Relay { cmd: RelayCmd::Add { url, admin } } => admin.run(&format!("relay add {url}")).await,
+        Cmd::Relay { cmd: RelayCmd::Remove { url, admin } } => admin.run(&format!("relay remove {url}")).await,
         Cmd::Invite { admin } => match wired_core::admin::request(&admin.dir(), "invite").await {
             Ok(out) => {
                 print!("{out}");
