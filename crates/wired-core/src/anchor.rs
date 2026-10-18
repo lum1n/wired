@@ -62,6 +62,7 @@ impl Inner {
         if let Some(a) = &self.anchor {
             a.updates.send_replace(snap);
         }
+        self.snap_changed.notify_waiters();
         self.persist();
     }
 

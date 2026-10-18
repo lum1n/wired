@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use iroh::{
     EndpointAddr, PublicKey, TransportAddr,
     endpoint::{Connection, Incoming, RecvStream, SendStream},
@@ -17,6 +17,8 @@ use crate::{
 };
 
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a dial waits for an unknown name to show up in the network state.
+const NAME_WAIT: Duration = Duration::from_secs(2);
 
 /// An error reported by the other side.
 #[derive(Debug, thiserror::Error)]
@@ -114,7 +116,7 @@ impl Inner {
     // --- dialing -------------------------------------------------------------
 
     pub(crate) async fn dial(self: &Arc<Self>, service: &str, node: &str) -> Result<Stream> {
-        let key = *self.snapshot().members.get(node).with_context(|| format!("unknown node {node:?}"))?;
+        let key = self.member(node).await?;
         let id = PublicKey::from_bytes(&key).map_err(|e| anyhow!("{e}"))?;
         let peer = match self.live_peer(id) {
             Some(p) => p,
@@ -131,6 +133,24 @@ impl Inner {
         match reply {
             Reply::ServiceOk => Ok(Stream { send, recv, peer: PeerInfo { name: peer.name, id } }),
             other => Err(reply_err(other)),
+        }
+    }
+
+    /// The key of the member called `node`. A node that joined a moment ago may not have
+    /// reached us yet: the anchor pushes it within moments, so wait briefly for that.
+    async fn member(&self, node: &str) -> Result<[u8; 32]> {
+        let deadline = tokio::time::Instant::now() + NAME_WAIT;
+        loop {
+            // Registered before looking, so a snapshot arriving in between still wakes us.
+            let changed = self.snap_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(key) = self.snapshot().members.get(node) {
+                return Ok(*key);
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                bail!("unknown node {node:?}");
+            }
         }
     }
 

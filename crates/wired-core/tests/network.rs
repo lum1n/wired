@@ -177,3 +177,23 @@ async fn loopback_members_go_direct() {
         n.close().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_reachable_by_name_right_after_it_joins() {
+    init_logs();
+    let vps = anchor("vps").await;
+    let invite = vps.invite();
+    let a = member("a", &invite).await.unwrap();
+    for i in 0..5 {
+        // `a` learns about each new node from a pushed snapshot; dialing at once must not race it.
+        let name = format!("new{i}");
+        let fresh = member(&name, &invite).await.unwrap();
+        serve_echo(&fresh, "echo");
+        assert_eq!(roundtrip(&a, &format!("echo@{name}"), "x").await.unwrap(), "a:x");
+        fresh.close().await;
+    }
+    // A name that never joins still fails, after a short wait.
+    assert!(a.dial("echo@ghost").await.is_err());
+    a.close().await;
+    vps.close().await;
+}

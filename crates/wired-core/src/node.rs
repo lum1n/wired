@@ -203,6 +203,8 @@ pub(crate) struct Inner {
     pub(crate) cert: RwLock<Option<Cert>>,
     /// Latest network state. Authoritative on the root, replicated elsewhere.
     pub(crate) snap: RwLock<Arc<Snapshot>>,
+    /// Woken on every new snapshot, for a dial that waits on a name just joined.
+    pub(crate) snap_changed: tokio::sync::Notify,
     pub(crate) services: Mutex<HashMap<String, Service>>,
     pub(crate) peers: Mutex<HashMap<PublicKey, Peer>>,
     pub(crate) anchor: Option<AnchorState>,
@@ -715,6 +717,7 @@ fn new_inner(
         secret: RwLock::new(secret),
         cert: RwLock::new(cert),
         snap: RwLock::new(Arc::new(snap)),
+        snap_changed: tokio::sync::Notify::new(),
         services: Mutex::new(HashMap::new()),
         peers: Mutex::new(HashMap::new()),
         anchor,
