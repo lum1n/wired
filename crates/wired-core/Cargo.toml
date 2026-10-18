@@ -1,0 +1,28 @@
+[package]
+name = "wired-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+iroh-relay.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+postcard.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+rand.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+webpki.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

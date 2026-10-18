@@ -1,0 +1,7 @@
+/target
+node_modules/
+*.node
+.build/
+/bindings/go/lib/
+/bindings/swift/lib/
+/bindings/swift/WiredFFI.xcframework/

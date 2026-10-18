@@ -1,0 +1,5 @@
+[bindings.swift]
+module_name = "Wired"
+ffi_module_name = "WiredFFI"
+ffi_module_filename = "WiredFFI"
+generate_module_map = true

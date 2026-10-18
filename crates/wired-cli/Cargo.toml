@@ -1,0 +1,17 @@
+[package]
+name = "wired-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wired"
+path = "src/main.rs"
+
+[dependencies]
+wired.workspace = true
+wired-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

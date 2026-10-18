@@ -1,0 +1,22 @@
+[package]
+name = "wired-swift"
+description = "UniFFI scaffolding for the Swift binding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "wired_swift"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+wired.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+uniffi = { version = "0.32", features = ["tokio", "cli"] }

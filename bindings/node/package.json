@@ -1,0 +1,16 @@
+{
+  "name": "@wired/node",
+  "version": "0.1.0",
+  "description": "Embeddable, encrypted service-to-service networking",
+  "license": "MIT OR Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "wired.*.node"],
+  "engines": { "node": ">=20" },
+  "os": ["linux", "darwin"],
+  "scripts": {
+    "build": "node scripts/build.mjs --release",
+    "build:debug": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js"
+  }
+}
