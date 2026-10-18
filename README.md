@@ -147,3 +147,7 @@ tests/interop/matrix.sh         # echo between Rust, Go, Node and Swift, every p
 (cd bindings/node && npm test)
 (cd bindings/swift && swift test)
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
