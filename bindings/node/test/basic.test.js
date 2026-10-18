@@ -6,6 +6,9 @@ const http = require('node:http')
 const net = require('node:net')
 const { Node, relayProxy } = require('..')
 
+// A hang fails the test by name instead of stalling the run.
+const T = { timeout: 30_000 }
+
 const local = { bindHost: '127.0.0.1', port: 0, qadPort: 0, publicHost: '127.0.0.1', ephemeral: true }
 
 function get(agent, url) {
@@ -21,7 +24,7 @@ function get(agent, url) {
   })
 }
 
-test('http over wired, anchor to member', async () => {
+test('http over wired, anchor to member', T, async () => {
   const vps = await Node.anchor({ name: 'vps', ...local })
   const laptop = await Node.join({ name: 'laptop', invite: vps.invite, ephemeral: true })
 
@@ -45,7 +48,7 @@ test('http over wired, anchor to member', async () => {
   await vps.close()
 })
 
-test('raw socket echo with half-close', async () => {
+test('raw socket echo with half-close', T, async () => {
   const vps = await Node.anchor({ name: 'vps', ...local })
   const a = await Node.join({ name: 'a', invite: vps.invite, ephemeral: true })
   const b = await Node.join({ name: 'b', invite: vps.invite, ephemeral: true })
@@ -75,7 +78,7 @@ test('raw socket echo with half-close', async () => {
   await vps.close()
 })
 
-test('allowlist, admin calls and revoke', async () => {
+test('allowlist, admin calls and revoke', T, async () => {
   const vps = await Node.anchor({ name: 'vps', ...local })
   const a = await Node.join({ name: 'a', invite: vps.invite, ephemeral: true })
   const b = await Node.join({ name: 'b', invite: vps.invite, ephemeral: true })
@@ -112,7 +115,7 @@ function freePort() {
   })
 }
 
-test('root behind NAT, relay behind an app server on one port (exe.dev-style)', async () => {
+test('root behind NAT, relay behind an app server on one port (exe.dev-style)', T, async () => {
   // home: the root on a laptop, no relay, unreachable directly.
   const home = await Node.anchor({ name: 'home', bindHost: '127.0.0.1', port: 0, noRelay: true, relayOnly: true, ephemeral: true })
 
@@ -149,7 +152,7 @@ test('root behind NAT, relay behind an app server on one port (exe.dev-style)', 
   app.close()
 })
 
-test('expose and admin calls work from the JS thread', async () => {
+test('expose and admin calls work from the JS thread', T, async () => {
   const vps = await Node.anchor({ name: 'vps', ...local })
   const laptop = await Node.join({ name: 'laptop', invite: vps.invite, ephemeral: true })
   const backend = http.createServer((req, res) => res.end('exposed'))

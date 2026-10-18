@@ -16,7 +16,7 @@ This document is normative for every Wired implementation and binding.
 
 A relay is listed as `RelayInfo { url, pin, qad_port, owner }`. There are two kinds:
 - **Public:** on a reachable host. HTTPS uses a self-signed certificate made from the serving node's key. `pin` is that key, and clients accept the certificate only if it carries it. QUIC address discovery runs on `qad_port`.
-- **Behind a proxy:** a TLS-terminating proxy (exe.dev, nginx, Caddy) forwards `/relay` (a WebSocket) and `/ping` at the root of `url` to the relay's plain-HTTP socket. `pin` is `None`, so clients check the certificate against the usual CA roots. There is no address discovery.
+- **Behind a proxy:** a TLS-terminating proxy (exe.dev, nginx, Caddy) forwards `/relay` (a WebSocket) and `/ping` at the root of `url` to the relay's plain-HTTP socket. `pin` is `None`, so clients check the certificate against the usual CA roots: Mozilla's, and the system's (which honor `SSL_CERT_FILE` and `SSL_CERT_DIR`). There is no address discovery.
 
 **Access.** Relays admit a client only when both hold:
 - it presents `Authorization: Bearer T`, where `T = hex(SHA-256("wired/1 relay-token" ‖ network_id)[..16])`;

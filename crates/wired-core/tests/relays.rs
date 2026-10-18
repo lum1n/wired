@@ -194,3 +194,70 @@ async fn relays_admit_only_the_network_and_not_revoked_keys() {
         n.close().await;
     }
 }
+
+/// Stands in for exe.dev's proxy with real TLS: terminates HTTPS with a certificate from a private
+/// CA and forwards to `target`. Returns the port and the CA certificate (PEM).
+async fn tls_proxy(target: SocketAddr) -> (u16, String) {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, rcgen::KeyPair::generate().unwrap()).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap().signed_by(&key, &ca).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(wired_core::tls::provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone(), ca.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(inbound).await else { return };
+                if let Ok(mut outbound) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (port, ca.pem())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_behind_a_tls_proxy_with_a_ca_certificate() {
+    init_logs();
+    let relay_port = free_port().await;
+    let (proxy_port, ca_pem) = tls_proxy(SocketAddr::from(([127, 0, 0, 1], relay_port))).await;
+    // Trust the private CA the way a host would: through the system's trust store variables.
+    let ca_file = std::env::temp_dir().join(format!("wired-test-ca-{}.pem", rand::random::<u64>()));
+    std::fs::write(&ca_file, ca_pem).unwrap();
+    // SAFETY: only read when nodes build their TLS configs; other tests here use plain HTTP.
+    unsafe { std::env::set_var("SSL_CERT_FILE", &ca_file) };
+
+    let home = unreachable_root().await;
+    let url = format!("https://127.0.0.1:{proxy_port}");
+    home.add_relay(&url).unwrap();
+    let serve = RelayServe::BehindProxy { bind: SocketAddr::from(([127, 0, 0, 1], relay_port)), url };
+    let robin = tokio::time::timeout(
+        Duration::from_secs(30),
+        Node::builder("robin").invite(home.invite().parse().unwrap()).relay(serve).relay_only().ephemeral().spawn(),
+    )
+    .await
+    .expect("join hung")
+    .unwrap();
+    serve_echo(&home);
+    serve_echo(&robin);
+    echo(&home, "echo@robin").await.unwrap();
+    echo(&robin, "echo@home").await.unwrap();
+    assert_eq!(home.path("robin"), Some(PathKind::Relay));
+    robin.close().await;
+    home.close().await;
+    std::fs::remove_file(ca_file).ok();
+}

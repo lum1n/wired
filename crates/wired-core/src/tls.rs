@@ -64,7 +64,7 @@ fn cert_key(cert: &CertificateDer<'_>) -> Option<PublicKey> {
 pub type Pinned = Arc<RwLock<Vec<PublicKey>>>;
 
 /// Accepts a certificate whose key is pinned, or else one that chains to the
-/// usual CA roots for the server name.
+/// usual CA roots (Mozilla's and the system's) for the server name.
 pub struct PinnedVerifier {
     pinned: Pinned,
     provider: Arc<CryptoProvider>,
@@ -73,7 +73,10 @@ pub struct PinnedVerifier {
 
 impl PinnedVerifier {
     pub fn new(pinned: Pinned, provider: Arc<CryptoProvider>) -> Result<Self, rustls::Error> {
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        // Mozilla's roots, plus the system's (which honor SSL_CERT_FILE / SSL_CERT_DIR), so a
+        // relay behind a proxy with a private or corporate CA can be trusted.
+        let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
             .build()
             .map_err(|e| rustls::Error::General(e.to_string()))?;

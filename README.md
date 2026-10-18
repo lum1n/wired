@@ -9,6 +9,14 @@ Wired is an embeddable library that lets services talk to each other over an enc
 
 Built on [iroh](https://iroh.computer), with all of n0's default infrastructure turned off.
 
+## Install
+
+Each [release](https://github.com/lum1n/wired/releases) has, for Linux x64/arm64 and macOS arm64:
+- `wired-<version>-<platform>.tar.gz`: the `wired` CLI.
+- `wired-node-<version>-<platform>.tar.gz`: the Node binding, ready to `require('./wired-node')`.
+
+`SHA256SUMS` lists their hashes. Linux builds need glibc 2.35 or newer (Debian 12, Ubuntu 22.04). To build from source: `cargo build --release -p wired-cli`.
+
 ## The 60-second version
 
 On a VPS with a public IP, start the anchor (it serves a relay too) and forward a local port to the laptop's service:

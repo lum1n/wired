@@ -1,0 +1,68 @@
+# A Wired release, from a tag such as v0.1.0. Per platform:
+#   wired-node-<version>-<platform>.tar.gz   the Node binding, ready to load (wired-node/index.js)
+#   wired-<version>-<platform>.tar.gz        the `wired` CLI
+# plus SHA256SUMS. Linux builds run on Ubuntu 22.04 so they load on glibc 2.35 and newer
+# (Debian 12, which Nudge's image uses, has 2.36).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x64
+          - runner: ubuntu-22.04-arm
+            platform: linux-arm64
+          - runner: macos-14
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build
+        run: |
+          node bindings/node/scripts/build.mjs --release
+          cargo build --release -p wired-cli
+      - name: Package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p out stage/wired-node
+          cp bindings/node/index.js bindings/node/index.d.ts bindings/node/package.json bindings/node/wired.*.node stage/wired-node/
+          tar -czf "out/wired-node-$version-${{ matrix.platform }}.tar.gz" -C stage wired-node
+          tar -czf "out/wired-$version-${{ matrix.platform }}.tar.gz" -C target/release wired
+      - name: Check the binding loads
+        run: |
+          tar -xzf out/wired-node-*.tar.gz -C "$RUNNER_TEMP"
+          node -e "const w = require(process.argv[1]); if (typeof w.Node.anchor !== 'function') process.exit(1)" "$RUNNER_TEMP/wired-node/index.js"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: out/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: cd out && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Make the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          gh release create "$GITHUB_REF_NAME" $pre --repo "$GITHUB_REPOSITORY" --generate-notes out/*
