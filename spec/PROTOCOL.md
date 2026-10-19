@@ -54,7 +54,7 @@ The token keeps strangers off the relay's bandwidth; it is not what protects tra
 
 All control messages are frames: a u32 big-endian length (at most 1 MiB) followed by the postcard encoding of the message. See `crates/wired-core/src/proto.rs`.
 
-Every QUIC bidirectional stream starts with one `Open` frame from the side that opened it. The accepting side answers with one `Reply` frame. For `Watch`, the reply is a sequence of frames.
+Every QUIC bidirectional stream starts with one `Open` frame from the side that opened it. The accepting side answers with one `Reply` frame. For `Watch`, the reply is a sequence of frames: one `State`, then `Delta`s.
 
 ## Certificates
 
@@ -109,8 +109,18 @@ Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo],
 ```
 
 - The root owns the snapshot and increments `version` on every change.
-- A node sends `Open::Watch` to an anchor. The anchor sends `Reply::State(snapshot)` immediately, and again on every change, for as long as the stream stays open.
-- `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`.
+- A node sends `Open::Watch` to an anchor. The anchor sends `Reply::State(snapshot)` immediately. After that, for as long as the stream stays open, it sends a `Reply::Delta` on every change:
+
+  ```
+  Delta { from, to, members_set: name → key, members_removed: {name},
+          denied_added: {key}, denied_removed: {key},
+          anchors: Option<[AnchorInfo]>, relays: Option<[RelayInfo]>, secret }
+  ```
+
+  - `from` is the version of the previous frame on the stream and `to` the new version. Several changes may arrive as one delta.
+  - `members_set` holds the names that were added or whose key changed. `anchors` and `relays` are the full lists, sent only when they changed.
+  - The watcher applies a delta to the state of the previous frame *on this stream*, which can be older than the state it holds. It then handles the result like a full snapshot. A delta whose `from` doesn't match is a protocol error: the watcher drops the session and reconnects.
+- `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`. Each frame carries the current value.
 - Nodes ignore snapshots older than the one they have.
 - Each member and replica keeps one Watch session open:
   - It starts attempts at anchors root first, 2 seconds apart, and keeps the first that succeeds.
@@ -135,7 +145,7 @@ Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo],
 
 Revoking a node on the root does the following:
 1. Removes its name, adds its key to `denied`, removes it from `anchors` and any relays it owns, and rotates `S`.
-2. Publishes the new snapshot. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
+2. Publishes the change. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
 
 Existing members keep working. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
 
