@@ -18,7 +18,7 @@
 pub use wired_core::relay;
 pub use wired_core::{
     AnchorConfig, AnchorInfo, Builder, ErrorCode, Invite, Listener, Member, NetworkSecret, Node, PathKind, PeerInfo,
-    PublicKey, RelayInfo, RelayServe, RemoteError, SecretKey, Stream, Task,
+    PublicKey, RelayInfo, RelayServe, RelayStatus, RemoteError, SecretKey, Stream, Task,
     node::{parse_target, valid_name},
 };
 #[cfg(unix)]

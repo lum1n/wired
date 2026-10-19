@@ -16,7 +16,7 @@ pub mod tls;
 
 pub use invite::{AnchorInfo, Invite, NetworkSecret, RelayInfo};
 pub use iroh::{PublicKey, SecretKey};
-pub use node::{AnchorConfig, Builder, Listener, Member, Node, PathKind, PeerInfo, Stream, Task};
+pub use node::{AnchorConfig, Builder, Listener, Member, Node, PathKind, PeerInfo, RelayStatus, Stream, Task};
 pub use peer::RemoteError;
 pub use proto::ErrorCode;
 pub use relay::RelayServe;

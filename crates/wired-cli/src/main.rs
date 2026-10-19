@@ -86,6 +86,11 @@ enum Cmd {
         #[command(flatten)]
         admin: Admin,
     },
+    /// This node's connection to its home relay.
+    Status {
+        #[command(flatten)]
+        admin: Admin,
+    },
     /// List the network's members.
     Members {
         #[command(flatten)]
@@ -280,5 +285,6 @@ async fn main() -> Result<()> {
         Cmd::Rotate { admin } => admin.run("rotate").await,
         Cmd::Approve { id, admin } => admin.run(&format!("approve {id}")).await,
         Cmd::Members { admin } => admin.run("members").await,
+        Cmd::Status { admin } => admin.run("status").await,
     }
 }

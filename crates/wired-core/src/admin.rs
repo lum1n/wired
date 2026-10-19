@@ -66,13 +66,28 @@ fn dispatch(node: &Node, line: &str) -> Result<String> {
             node.remove_relay(url)?;
             "removed\n".into()
         }
+        ["status"] => {
+            let status = node.relay_status();
+            if status.is_empty() {
+                "home relay: none (no relay listed, or none answered yet)\n".into()
+            } else {
+                status
+                    .iter()
+                    .map(|r| match (&r.error, r.connected) {
+                        (_, true) => format!("home relay: {} connected\n", r.url),
+                        (Some(e), false) => format!("home relay: {} NOT connected: {e}\n", r.url),
+                        (None, false) => format!("home relay: {} not connected yet\n", r.url),
+                    })
+                    .collect()
+            }
+        }
         ["members"] => node
             .members()
             .iter()
             .map(|m| format!("{}\t{}\t{}\n", m.name, m.id, if m.anchor { "anchor" } else { "member" }))
             .collect(),
         _ => bail!(
-            "unknown command {line:?}; try invite, rotate, revoke <name>, approve <id>, members, relays, relay add|remove <url>"
+            "unknown command {line:?}; try invite, rotate, revoke <name>, approve <id>, members, relays, relay add|remove <url>, status"
         ),
     })
 }

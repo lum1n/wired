@@ -84,6 +84,30 @@ pub(crate) struct ServedRelay {
     pub(crate) server: std::sync::Mutex<Option<Server>>,
 }
 
+impl ServedRelay {
+    /// Stops it, disconnecting its clients so they look for another relay.
+    pub(crate) async fn shutdown(&self) {
+        let server = self.server.lock().unwrap().take();
+        if let Some(server) = server {
+            let _ = server.shutdown().await;
+        }
+    }
+}
+
+impl Drop for ServedRelay {
+    /// A relay server dropped without shutting down stops accepting but keeps the clients it has,
+    /// which then stay attached to it, looking connected. So it is shut down here too.
+    fn drop(&mut self) {
+        if let Some(server) = self.server.get_mut().unwrap().take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                let _ = server.shutdown().await;
+            });
+        }
+    }
+}
+
 pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8; 16]) -> Result<ServedRelay> {
     let denied = Arc::new(RwLock::new(BTreeSet::new()));
     let access = Arc::new(RelayAccess { token: token(network_id), denied: denied.clone() });
@@ -154,5 +178,29 @@ mod tests {
         assert_eq!(token(&[1; 16]), token(&[1; 16]));
         assert_ne!(token(&[1; 16]), token(&[2; 16]));
         assert_eq!(token(&[1; 16]).len(), 32);
+    }
+
+    /// A relay dropped without `Node::close`, as when a first join fails, must not keep its
+    /// clients: they would stay attached to it, looking connected, and miss the one that replaces it.
+    #[tokio::test]
+    async fn dropping_a_relay_disconnects_its_clients() {
+        use n0_future::StreamExt;
+
+        let key = SecretKey::generate();
+        let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
+        let relay = start(&serve, &key, &[3; 16]).await.unwrap();
+        let url: iroh::RelayUrl = format!("http://{}", relay.local_addr).parse().unwrap();
+        let mut client = iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
+            .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
+            .auth_token(token(&[3; 16]))
+            .connect()
+            .await
+            .unwrap();
+        drop(relay);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(Ok(_)) = client.next().await {}
+        })
+        .await;
+        assert!(gone.is_ok(), "the client is still connected to a relay that was dropped");
     }
 }

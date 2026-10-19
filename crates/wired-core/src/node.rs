@@ -175,6 +175,15 @@ pub struct Member {
     pub anchor: bool,
 }
 
+/// This node's connection to its home relay: the relay others reach it through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayStatus {
+    pub url: String,
+    pub connected: bool,
+    /// Why the last attempt to connect failed, if one did.
+    pub error: Option<String>,
+}
+
 /// How traffic to a peer currently flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
@@ -295,6 +304,26 @@ impl Node {
         self.inner.snapshot().relays.clone()
     }
 
+    /// Its home relay connection, the relay other nodes reach it through. Empty while it has
+    /// none: no relay listed, or none answered its probes yet.
+    pub fn relay_status(&self) -> Vec<RelayStatus> {
+        use iroh::Watcher;
+        self.inner
+            .ep
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .map(|r| RelayStatus {
+                url: r.url().to_string(),
+                connected: r.is_connected(),
+                error: r
+                    .auth_denied_reason()
+                    .map(|reason| format!("the relay denied this node: {reason}"))
+                    .or_else(|| r.last_error().map(|e| format!("{e:#}"))),
+            })
+            .collect()
+    }
+
     /// The relay this node serves: its public URL and the local address it
     /// listens on (for `BehindProxy`, where the proxy should forward to).
     pub fn served_relay(&self) -> Option<(String, SocketAddr)> {
@@ -411,9 +440,8 @@ impl Node {
         self.inner.services.lock().unwrap().clear();
         self.inner.ep.close().await;
         // Free the relay's ports now, not whenever the last handle to this node is dropped.
-        let relay = self.inner.relay.as_ref().and_then(|r| r.server.lock().unwrap().take());
-        if let Some(server) = relay {
-            let _ = server.shutdown().await;
+        if let Some(relay) = &self.inner.relay {
+            relay.shutdown().await;
         }
     }
 }
@@ -789,6 +817,9 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
         Err(e) => {
             if is_fatal(&e) || !cached {
                 inner.ep.close().await;
+                if let Some(relay) = &inner.relay {
+                    relay.shutdown().await;
+                }
                 return Err(e.context("could not join the network"));
             }
             warn!("no anchor reachable, starting from cached state: {e:#}");
