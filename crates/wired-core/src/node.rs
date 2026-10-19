@@ -623,7 +623,7 @@ impl Inner {
             if let Some(pin) = r.pin.and_then(|p| PublicKey::from_bytes(&p).ok()) {
                 self.pinned.write().unwrap().push(pin);
             }
-            match relay_config(&r, &token) {
+            match relay_config(&r, self.relay.as_ref(), &token) {
                 Ok(config) => {
                     self.ep.insert_relay(config.url.clone(), Arc::new(config)).await;
                 }
@@ -631,11 +631,11 @@ impl Inner {
             }
         }
         for u in remove {
-            if let Ok(url) = u.parse::<RelayUrl>() {
+            if let Ok(url) = self.reach(&u).parse::<RelayUrl>() {
                 self.ep.remove_relay(&url).await;
             }
         }
-        let relays = relay_urls(snap);
+        let relays = self.relay_urls_of(snap);
         for a in &snap.anchors {
             if let Ok(id) = PublicKey::from_bytes(&a.id)
                 && id != self.ep.id()
@@ -647,7 +647,16 @@ impl Inner {
 
     /// Relay URLs to reach a peer through: every relay in the network.
     pub(crate) fn relay_urls(&self) -> Vec<RelayUrl> {
-        relay_urls(&self.snapshot())
+        self.relay_urls_of(&self.snapshot())
+    }
+
+    fn relay_urls_of(&self, snap: &Snapshot) -> Vec<RelayUrl> {
+        snap.relays.iter().filter_map(|r| self.reach(&r.url).parse().ok()).collect()
+    }
+
+    /// The URL this node uses for a network relay: the relay it serves at its local address.
+    fn reach<'a>(&'a self, url: &'a str) -> &'a str {
+        self.relay.as_ref().map_or(url, |r| r.reach(url))
     }
 }
 
@@ -655,13 +664,12 @@ fn norm_url(u: &str) -> String {
     u.trim_end_matches('/').to_string()
 }
 
-fn relay_urls(snap: &Snapshot) -> Vec<RelayUrl> {
-    snap.relays.iter().filter_map(|r| r.url.parse().ok()).collect()
-}
-
-fn relay_config(r: &RelayInfo, token: &str) -> Result<iroh::RelayConfig> {
-    let url: RelayUrl = r.url.parse().with_context(|| format!("bad relay url {}", r.url))?;
-    Ok(iroh::RelayConfig::new(url, r.qad_port.map(iroh_relay::RelayQuicConfig::new)).with_auth_token(token))
+fn relay_config(r: &RelayInfo, own: Option<&ServedRelay>, token: &str) -> Result<iroh::RelayConfig> {
+    let reached = own.map_or(r.url.as_str(), |o| o.reach(&r.url));
+    let url: RelayUrl = reached.parse().with_context(|| format!("bad relay url {reached}"))?;
+    // Address discovery against our own relay, at its local address, would only see loopback.
+    let qad = if reached == r.url { r.qad_port.map(iroh_relay::RelayQuicConfig::new) } else { None };
+    Ok(iroh::RelayConfig::new(url, qad).with_auth_token(token))
 }
 
 async fn anchor_addr(id: PublicKey, relays: &[RelayUrl], hosts: &[String]) -> EndpointAddr {
@@ -703,13 +711,14 @@ async fn bind_endpoint(
     key: SecretKey,
     network_id: &[u8; 16],
     relays: &[RelayInfo],
+    own: Option<&ServedRelay>,
     bind: Option<SocketAddr>,
     relay_only: bool,
 ) -> Result<Bound> {
     let pins = relays.iter().filter_map(|r| r.pin.and_then(|p| PublicKey::from_bytes(&p).ok())).collect();
     let pinned: tls::Pinned = Arc::new(RwLock::new(pins));
     let token = relay::token(network_id);
-    let map: RelayMap = relays.iter().map(|r| relay_config(r, &token)).collect::<Result<_>>()?;
+    let map: RelayMap = relays.iter().map(|r| relay_config(r, own, &token)).collect::<Result<_>>()?;
     let lookup = MemoryLookup::new();
     let mut net_report = NetReportConfig::default();
     // Relays behind proxies serve only `/relay` and `/ping`; no `/generate_204`.
@@ -794,7 +803,7 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
     let relay = start_relay(&b, &key, &invite.network_id).await?;
     let relays =
         merge(snap.relays.clone(), &relay.iter().map(|r| r.info.clone()).collect::<Vec<_>>(), |r| norm_url(&r.url));
-    let bound = bind_endpoint(key, &invite.network_id, &relays, None, b.relay_only).await?;
+    let bound = bind_endpoint(key, &invite.network_id, &relays, relay.as_ref(), None, b.relay_only).await?;
     let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, None, relay, dir);
     inner.learn_network(&inner.snapshot()).await;
 
@@ -863,7 +872,7 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     let own_relay: Vec<RelayInfo> = relay.iter().map(|r| r.info.clone()).collect();
     let relays = merge(snap.relays.clone(), &own_relay, |r| norm_url(&r.url));
     let bind = (!b.relay_only).then_some(cfg.bind);
-    let bound = bind_endpoint(key.clone(), &network_id, &relays, bind, b.relay_only).await?;
+    let bound = bind_endpoint(key.clone(), &network_id, &relays, relay.as_ref(), bind, b.relay_only).await?;
     let mut info = AnchorInfo { id: me, addrs: Vec::new() };
     if let Some(socket) = bound.ep.bound_sockets().first() {
         let host = match cfg.public_host.clone() {

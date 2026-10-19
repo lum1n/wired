@@ -1,6 +1,6 @@
 {
   "name": "@wired/node",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Embeddable, encrypted service-to-service networking",
   "license": "MIT",
   "main": "index.js",

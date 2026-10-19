@@ -96,6 +96,20 @@ async fn root_behind_nat_and_a_vm_relay_reach_each_other() {
     serve_echo(&home);
     serve_echo(&robin);
 
+    // Robin reaches its own relay at its local address, not through the proxy: on exe.dev the
+    // public URL doesn't lead back to the VM.
+    let (_, local) = robin.served_relay().unwrap();
+    let direct = format!("http://{local}/");
+    let mut status = robin.relay_status();
+    for _ in 0..100 {
+        if status.iter().any(|r| r.connected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        status = robin.relay_status();
+    }
+    assert!(status.iter().any(|r| r.connected && r.url == direct), "{status:?}");
+
     // Both directions, all through robin's relay.
     echo(&home, "echo@robin").await.unwrap();
     echo(&robin, "echo@home").await.unwrap();
@@ -273,4 +287,28 @@ async fn closing_a_node_frees_its_relay_port() {
     let _still_held = robin;
     TcpListener::bind(local).await.expect("the relay's port is still taken after close");
     home.close().await;
+}
+
+/// A node whose public address doesn't lead back to itself (a router without hairpin NAT; here
+/// an address nobody routes) still connects to the relay it serves, at its local address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_reaches_its_own_relay_when_its_public_address_does_not_loop_back() {
+    init_logs();
+    let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let serve = RelayServe::Public { bind: lo, qad_bind: None, public_host: Some("192.0.2.1".into()) };
+    let cfg = AnchorConfig { bind: lo, public_host: Some("127.0.0.1".into()), replica_of: None };
+    let node = Node::builder("home").anchor(cfg).relay(serve).ephemeral().spawn().await.unwrap();
+    let (url, local) = node.served_relay().unwrap();
+    assert!(url.starts_with("https://192.0.2.1:"), "{url}");
+    let direct = format!("https://{local}/");
+    let mut status = node.relay_status();
+    for _ in 0..100 {
+        if status.iter().any(|r| r.connected) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        status = node.relay_status();
+    }
+    assert!(status.iter().any(|r| r.connected && r.url == direct), "{status:?}");
+    node.close().await;
 }

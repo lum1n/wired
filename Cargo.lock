@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "wired"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "tokio",
@@ -4630,7 +4630,7 @@ dependencies = [
 
 [[package]]
 name = "wired-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -4642,7 +4642,7 @@ dependencies = [
 
 [[package]]
 name = "wired-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "wired-ffi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "tokio",
@@ -4679,7 +4679,7 @@ dependencies = [
 
 [[package]]
 name = "wired-node"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "napi",
@@ -4691,7 +4691,7 @@ dependencies = [
 
 [[package]]
 name = "wired-swift"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "thiserror 2.0.21",

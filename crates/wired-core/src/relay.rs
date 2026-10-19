@@ -4,7 +4,7 @@
 
 use std::{
     collections::BTreeSet,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, RwLock},
 };
 
@@ -80,11 +80,20 @@ pub(crate) struct ServedRelay {
     /// Where it listens (for `BehindProxy`, what the proxy forwards to).
     pub(crate) local_addr: SocketAddr,
     pub(crate) denied: Arc<RwLock<BTreeSet<[u8; 32]>>>,
+    /// The URL this node itself reaches it at: its local address. The public URL may not lead
+    /// back to the host it is served from: behind a proxy (on exe.dev it resolves to the VM's
+    /// internal address, where nothing serves HTTPS), or a router without hairpin NAT.
+    pub(crate) self_url: String,
     /// Taken by `Node::close`, which shuts it down so its port is free again at once.
     pub(crate) server: std::sync::Mutex<Option<Server>>,
 }
 
 impl ServedRelay {
+    /// The URL this node uses for `url`: its local address when `url` is this relay's.
+    pub(crate) fn reach<'a>(&'a self, url: &'a str) -> &'a str {
+        if same_url(url, &self.info.url) { &self.self_url } else { url }
+    }
+
     /// Stops it, disconnecting its clients so they look for another relay.
     pub(crate) async fn shutdown(&self) {
         let server = self.server.lock().unwrap().take();
@@ -156,7 +165,15 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
             (server, info, http)
         }
     };
-    Ok(ServedRelay { info, local_addr, denied, server: std::sync::Mutex::new(Some(server)) })
+    let ip = match local_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    // A public relay's certificate is pinned by key, so the local address verifies as well.
+    let scheme = if info.pin.is_some() { "https" } else { "http" };
+    let self_url = format!("{scheme}://{}", SocketAddr::new(ip, local_addr.port()));
+    Ok(ServedRelay { info, local_addr, denied, self_url, server: std::sync::Mutex::new(Some(server)) })
 }
 
 /// `[v6]` for IPv6 literals, as URLs and `host:port` need.
