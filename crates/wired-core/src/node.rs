@@ -36,6 +36,8 @@ use crate::{
 };
 
 const DEFAULT_PORT: u16 = 7443;
+/// How long a node with no cached state keeps trying to join before giving up.
+const FIRST_JOIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Settings for running a node as an anchor. An anchor holds authority (the
 /// root key, or a replica of the network state); it does not need to be
@@ -768,10 +770,23 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
     let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, None, relay, dir);
     inner.learn_network(&inner.snapshot()).await;
 
-    match inner.open_session_any().await {
+    let cached = inner.cert.read().unwrap().as_ref().is_some_and(|c| cert::remaining(c) > 0);
+    // A first join keeps trying for a while: the root may still be backing off from a relay that
+    // didn't exist yet, as when this node's own relay was listed just before it started.
+    let deadline = std::time::Instant::now() + FIRST_JOIN;
+    let first = loop {
+        match inner.open_session_any().await {
+            Ok(session) => break Ok(session),
+            Err(e) if is_fatal(&e) || cached || std::time::Instant::now() >= deadline => break Err(e),
+            Err(e) => {
+                info!("not in the network yet, trying again: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+    match first {
         Ok(session) => inner.spawn(inner.clone().control_loop(Some(session))),
         Err(e) => {
-            let cached = inner.cert.read().unwrap().as_ref().is_some_and(|c| cert::remaining(c) > 0);
             if is_fatal(&e) || !cached {
                 inner.ep.close().await;
                 return Err(e.context("could not join the network"));
