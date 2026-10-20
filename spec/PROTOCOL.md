@@ -149,6 +149,14 @@ Limits:
 2. The replica then sends `Join` with its `AnchorInfo` (and its `RelayInfo` if it serves one), receives an anchor certificate, and keeps a Watch session to replicate the snapshot.
 3. If the root is down, existing members renew at replicas, peers keep verifying each other's certificates (chains end at the root key), and names keep resolving. Only new joins, revocations and approvals wait for the root.
 
+### Losing the root
+
+A replica can't become the root. Only the root holds the root key, and invites, certificates and every node's trust all name it. With the root key gone, nothing can issue anchor certificates. Replicas renew at the root once less than half their lifetime is left, so their certificates run out 15 to 30 days after the root's last renewal. Member certificates they issued stop verifying at the same time.
+
+Recovery is one of these:
+- **Restore the root's state directory.** The key (`<name>.key`) never changes. `anchor/state` does, and nodes apply a snapshot only if its `version` is higher than theirs. A root restored from a stale copy has a lower `version` than the network, so its updates are ignored until it has made as many changes as it missed.
+- **Start a new network** with a new root key and `network_id`, and have every node join again with its invite. Nodes ignore cached state for another `network_id` or root.
+
 ## Errors
 
 | Code | Meaning |
