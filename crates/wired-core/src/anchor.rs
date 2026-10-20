@@ -231,7 +231,8 @@ impl Node {
     /// node drops connections to it, and certificates it issued (if it was an
     /// anchor) stop being accepted. The join secret is rotated, so the
     /// returned invite replaces the old one for adding new nodes; existing
-    /// members are unaffected.
+    /// members are unaffected, even ones whose certificate expired while
+    /// they were offline (registered keys renew without the secret).
     pub fn revoke(&self, name: &str) -> Result<String> {
         self.require_root("revoke nodes")?;
         let inner = &self.inner;

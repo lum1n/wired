@@ -122,7 +122,7 @@ The relay admits only this network's nodes (it checks a token derived from the n
 
 - Restrict a service to named nodes with `--allow api=vps,desktop` on the CLI, or `listen_allow` / `expose_allow` in the library. Names are bound to keys by certificates and are unique in the network.
 - `wired members` lists the network's nodes.
-- `wired revoke <name>` removes a node now. Every node drops its connections to it within moments. The join secret rotates, so the command prints a new invite; existing members are unaffected, and the revoked node can't rejoin under any key.
+- `wired revoke <name>` removes a node now. Every node drops its connections to it within moments. The join secret rotates, so the command prints a new invite; existing members are unaffected (even one that was offline past its 24-hour certificate renews with its key, not the secret), and the revoked node can't rejoin under any key.
 - `wired rotate` replaces a leaked invite without revoking anyone.
 
 Admin commands talk to the running anchor through a local socket in its state directory, so only the user running the anchor can use them.

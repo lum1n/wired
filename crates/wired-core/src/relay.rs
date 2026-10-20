@@ -207,12 +207,13 @@ mod tests {
         let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
         let relay = start(&serve, &key, &[3; 16]).await.unwrap();
         let url: iroh::RelayUrl = format!("http://{}", relay.local_addr).parse().unwrap();
-        let mut client = iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
-            .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
-            .auth_token(token(&[3; 16]))
-            .connect()
-            .await
-            .unwrap();
+        let mut client =
+            iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
+                .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
+                .auth_token(token(&[3; 16]))
+                .connect()
+                .await
+                .unwrap();
         drop(relay);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(Ok(_)) = client.next().await {}
