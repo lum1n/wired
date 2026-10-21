@@ -137,7 +137,7 @@ Revoking a node on the root does the following:
 1. Removes its name, adds its key to `denied`, removes it from `anchors` and any relays it owns, and rotates `S`.
 2. Publishes the new snapshot. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
 
-Existing members keep working. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
+Existing members keep working. A registered key renews without a proof, so a member that was offline past its certificate rejoins with the old invite. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
 
 Limits:
 - A node that is cut off from every anchor learns of a revocation when it reconnects. Until then, the revoked node's certificate expires within 24 hours anyway.
