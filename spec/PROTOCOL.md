@@ -186,5 +186,5 @@ Recovery is one of these:
 ## Administration
 
 A running anchor listens on a Unix socket at `<state_dir>/anchor/admin.sock`. The socket has mode 0600 and sits in a 0700 directory.
-- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>`, `members`, `relays`, `relay add <url>` or `relay remove <url>`.
+- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>`, `members`, `relays`, `relay add <url>`, `relay remove <url>` or `status` (the anchor's connection to its home relay).
 - **Response:** `ok` followed by the output, or `error: <message>`.
