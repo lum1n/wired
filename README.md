@@ -144,6 +144,15 @@ wired approve <vps2-id>
 - If the root is down, the network keeps running: members renew at a replica and peers still verify each other. Only new joins, revocations and approvals wait for the root.
 - Back up the root's state directory (`~/.config/wired`). It holds the network's root key.
 
+### If the root's state directory is lost
+
+A replica can't be promoted to root. Replicas never hold the root key, and every invite, certificate and member pins that key, so there is nothing to hand over. Without the key, the network keeps running only as long as the replicas' anchor certificates last: 15 to 30 days after the root disappears. Members renew at replicas until then.
+
+- **From a backup.** Restore the directory and run `wired anchor` with the same `--name`. Only `<name>.key` is irreplaceable. It never changes, so one copy of it is enough. `anchor/state` holds the members, revocations, approvals and join secret, so a stale copy loses whatever changed after it was taken. Back it up again after each `revoke`, `rotate`, `approve` and new join. A stale copy is worse than it looks: members and replicas ignore a restored root's updates as older than the state they already hold, until the root has made as many changes as it missed. Until then, a revocation you redo there doesn't reach them.
+- **Without a backup.** Start a new network: run `wired anchor` with an empty state directory, which prints a new invite. Restart every member and replica with that invite, and approve the replicas again. Keys and names can stay the same. Each node ignores its cached state for the old network.
+
+Don't run `wired anchor` on an empty state directory if you meant to restore. It quietly creates a new network.
+
 ## Security model
 
 - The **invite is a credential**: it can add new nodes until the secret is rotated. Treat it like a password.
