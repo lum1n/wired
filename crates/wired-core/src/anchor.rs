@@ -11,7 +11,7 @@ use crate::{
     invite::{AnchorInfo, NetworkSecret, RelayInfo},
     node::{Inner, Node, valid_name},
     peer::Refusal,
-    proto::{Cert, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, PROTOCOL_VERSION, Reply, Role, Snapshot},
+    proto::{Cert, Delta, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, PROTOCOL_VERSION, Reply, Role, Snapshot},
     relay::same_url,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -167,18 +167,24 @@ impl Inner {
         Ok(cert::issue(self.ep.secret_key(), issuer_cert.as_ref(), self.network_id, remote, name, role))
     }
 
-    /// Streams the network state to a watcher, once now and again on every change.
+    /// Streams the network state to a watcher: in full now, then as a delta
+    /// from the previous frame on every change.
     pub(crate) async fn serve_watch(&self, mut send: SendStream, peer: PublicKey) -> Result<()> {
         let mut rx = self.anchor_state().updates.subscribe();
+        let mut sent: Option<Arc<Snapshot>> = None;
         loop {
             let snap = rx.borrow_and_update().clone();
-            let mut out = (*snap).clone();
             // Anchors get the join secret so they can hand out current invites.
-            out.secret = snap.is_anchor(peer.as_bytes()).then(|| self.secret.read().unwrap().clone());
-            frame::write(&mut send, &Reply::State(out)).await?;
+            let secret = snap.is_anchor(peer.as_bytes()).then(|| self.secret.read().unwrap().clone());
+            let reply = match &sent {
+                Some(prev) => Reply::Delta(Delta { secret, ..Delta::between(prev, &snap) }),
+                None => Reply::State(Snapshot { secret, ..(*snap).clone() }),
+            };
+            frame::write(&mut send, &reply).await?;
             if snap.denied.contains(peer.as_bytes()) {
                 return Ok(());
             }
+            sent = Some(snap);
             rx.changed().await?;
         }
     }
