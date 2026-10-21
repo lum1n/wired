@@ -14,6 +14,7 @@ Built on [iroh](https://iroh.computer), with all of n0's default infrastructure 
 Each [release](https://github.com/lum1n/wired/releases) has, for Linux x64/arm64 and macOS arm64:
 - `wired-<version>-<platform>.tar.gz`: the `wired` CLI.
 - `wired-node-<version>-<platform>.tar.gz`: the Node binding, ready to `require('./wired-node')`.
+- `wired-go-<version>-<platform>.tar.gz`: `libwired_ffi.a` for the Go binding (see [Other languages](#other-languages)).
 
 `SHA256SUMS` lists their hashes. Linux builds need glibc 2.35 or newer (Debian 12, Ubuntu 22.04). To build from source: `cargo build --release -p wired-cli`.
 
@@ -66,7 +67,7 @@ let stream = vps.dial("api@laptop").await?;
 
 Every binding wraps the same Rust core. On Unix, the Node and Go bindings get each stream as a socket descriptor, so you get native socket types. Swift gets async read/write instead.
 
-**Go** (`bindings/go`, cgo; run `scripts/build.sh` first). A `Listener` is a `net.Listener` and a `Conn` is a `net.Conn`.
+**Go** (`bindings/go`, cgo). A `Listener` is a `net.Listener` and a `Conn` is a `net.Conn`. The binding links the Rust core as a static library, which isn't in git. In a checkout, `scripts/build.sh` builds it, or `scripts/fetch.sh [version]` downloads it from a release, so no Rust is needed. In a module that depends on the binding, unpack `wired-go-<version>-<platform>.tar.gz` (or run `fetch.sh <version> <dir>`) and build with `CGO_LDFLAGS=-L<dir>`.
 
 ```go
 laptop, _ := wired.Join(wired.JoinOptions{Name: "laptop"})

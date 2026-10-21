@@ -1,11 +1,15 @@
 package wired
 
+// libwired_ffi.a is found in lib/<goos>_<goarch>/ (scripts/build.sh or scripts/fetch.sh put it
+// there), or in a directory given with CGO_LDFLAGS=-L<dir>, which is searched first. The latter
+// is how a module that depends on this one links a lib from a release.
+
 /*
 #cgo CFLAGS: -I${SRCDIR}/include
-#cgo linux,amd64 LDFLAGS: ${SRCDIR}/lib/linux_amd64/libwired_ffi.a -lm -ldl -lpthread
-#cgo linux,arm64 LDFLAGS: ${SRCDIR}/lib/linux_arm64/libwired_ffi.a -lm -ldl -lpthread
-#cgo darwin,amd64 LDFLAGS: ${SRCDIR}/lib/darwin_amd64/libwired_ffi.a -framework Security -framework CoreFoundation -framework SystemConfiguration
-#cgo darwin,arm64 LDFLAGS: ${SRCDIR}/lib/darwin_arm64/libwired_ffi.a -framework Security -framework CoreFoundation -framework SystemConfiguration
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/linux_amd64 -lwired_ffi -lm -ldl -lpthread
+#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/lib/linux_arm64 -lwired_ffi -lm -ldl -lpthread
+#cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/lib/darwin_amd64 -lwired_ffi -framework Security -framework CoreFoundation -framework SystemConfiguration
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/darwin_arm64 -lwired_ffi -framework Security -framework CoreFoundation -framework SystemConfiguration
 #include <stdlib.h>
 #include "wired.h"
 */
