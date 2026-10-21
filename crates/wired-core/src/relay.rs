@@ -221,4 +221,55 @@ mod tests {
         .await;
         assert!(gone.is_ok(), "the client is still connected to a relay that was dropped");
     }
+
+    #[test]
+    fn same_url_ignores_a_trailing_slash() {
+        assert!(same_url("https://r.example/", "https://r.example"));
+        assert!(!same_url("https://r.example", "https://r.example:7443"));
+    }
+
+    #[test]
+    fn url_host_brackets_ipv6() {
+        assert_eq!(url_host("::1"), "[::1]");
+        assert_eq!(url_host("10.0.0.1"), "10.0.0.1");
+    }
+
+    /// A node reaches the relay it serves at its local address, not its public URL, which may
+    /// not lead back to the host; other relays keep their URL.
+    #[tokio::test]
+    async fn reach_maps_only_our_relay_to_its_local_address() {
+        let serve =
+            RelayServe::BehindProxy { bind: "0.0.0.0:0".parse().unwrap(), url: "https://robin.exe.xyz/".into() };
+        let relay = start(&serve, &SecretKey::generate(), &[3; 16]).await.unwrap();
+        assert_eq!(relay.info.url, "https://robin.exe.xyz");
+        let local = format!("http://127.0.0.1:{}", relay.local_addr.port());
+        assert_eq!(relay.self_url, local, "an unspecified bind is reached at loopback, over plain http");
+        assert_eq!(relay.reach("https://robin.exe.xyz/"), local);
+        assert_eq!(relay.reach("https://other.example"), "https://other.example");
+        relay.shutdown().await;
+    }
+
+    /// A public relay's certificate is pinned by key, so its local address is reached over https.
+    #[tokio::test]
+    async fn public_relay_is_reached_locally_over_https() {
+        let serve = RelayServe::Public {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            qad_bind: None,
+            public_host: Some("vps.example.com".into()),
+        };
+        let relay = start(&serve, &SecretKey::generate(), &[3; 16]).await.unwrap();
+        let port = relay.local_addr.port();
+        assert_eq!(relay.info.url, format!("https://vps.example.com:{port}"));
+        assert_eq!(relay.reach(&relay.info.url), format!("https://127.0.0.1:{port}"));
+        relay.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn behind_proxy_url_must_be_an_http_origin() {
+        let key = SecretKey::generate();
+        for url in ["https://r.example/relay", "https://r.example/?x=1", "ftp://r.example"] {
+            let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: url.into() };
+            assert!(start(&serve, &key, &[3; 16]).await.is_err(), "{url} was accepted");
+        }
+    }
 }
