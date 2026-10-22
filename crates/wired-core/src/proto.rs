@@ -231,4 +231,59 @@ mod tests {
         let mut other = snap(3, &[], &[], &[]);
         assert!(Delta::between(&old, &new).apply(&mut other).is_err());
     }
+
+    #[test]
+    fn delta_undoes_removals() {
+        let old = snap(7, &[("a", 1), ("b", 2)], &[3, 4], &[]);
+        let new = snap(8, &[("a", 1)], &[4], &[]);
+        let delta = Delta::between(&old, &new);
+        assert_eq!(delta.members_removed, BTreeSet::from(["b".to_string()]));
+        assert_eq!(delta.denied_removed, BTreeSet::from([[3; 32]]));
+        assert!(delta.members_set.is_empty() && delta.denied_added.is_empty());
+        let mut got = old.clone();
+        delta.apply(&mut got).unwrap();
+        assert_eq!(got, new);
+    }
+
+    #[test]
+    fn delta_of_unchanged_state_carries_only_versions() {
+        let old = snap(2, &[("a", 1)], &[5], &[1]);
+        let new = Snapshot { version: 3, ..old.clone() };
+        assert_eq!(Delta::between(&old, &new), Delta { from: 2, to: 3, ..Delta::default() });
+    }
+
+    #[test]
+    fn delta_sends_changed_relays_in_full() {
+        let old = snap(1, &[], &[], &[]);
+        let relay = RelayInfo { url: "https://r.example".into(), pin: None, qad_port: None, owner: None };
+        let new = Snapshot { version: 2, relays: vec![relay], ..old.clone() };
+        let delta = Delta::between(&old, &new);
+        assert_eq!(delta.relays.as_deref(), Some(&new.relays[..]));
+        assert_eq!(delta.anchors, None);
+        let mut got = old.clone();
+        delta.apply(&mut got).unwrap();
+        assert_eq!(got, new);
+    }
+
+    /// The secret is the delta's, not the base's: a node no longer an anchor stops holding one.
+    #[test]
+    fn delta_replaces_the_secret() {
+        let mut held = Snapshot { secret: Some(NetworkSecret([1; 32])), ..snap(1, &[], &[], &[]) };
+        let next = snap(2, &[], &[], &[]);
+        Delta { secret: Some(NetworkSecret([2; 32])), ..Delta::between(&held, &next) }.apply(&mut held).unwrap();
+        assert_eq!(held.secret, Some(NetworkSecret([2; 32])));
+        let last = snap(3, &[], &[], &[]);
+        Delta::between(&held, &last).apply(&mut held).unwrap();
+        assert_eq!(held.secret, None);
+    }
+
+    #[test]
+    fn delta_survives_the_wire() {
+        let delta = Delta::between(&snap(1, &[("a", 1)], &[], &[1]), &snap(2, &[("b", 2)], &[1], &[]));
+        let bytes = postcard::to_stdvec(&Reply::Delta(delta.clone())).unwrap();
+        match postcard::from_bytes::<Reply>(&bytes).unwrap() {
+            Reply::Delta(got) => assert_eq!(got, delta),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
 }
