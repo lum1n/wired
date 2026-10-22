@@ -115,7 +115,7 @@ wired join --name robin --relay-url https://robin.exe.xyz --relay-bind 127.0.0.1
 
 If your app already owns the HTTPS port, forward just those two paths. In Node: `relayProxy('127.0.0.1:8790')` gives `matches`, `request` and `upgrade` handlers for an `http.Server`.
 
-`wired status` shows whether a node is connected to its home relay, the relay others reach it through, and why not if it isn't.
+On an anchor, `wired status` shows whether it is connected to its home relay, the relay others reach it through, and why not if it isn't. It talks to the admin socket (see [Access control](#access-control)), so it doesn't work on members.
 
 The relay admits only this network's nodes (it checks a token derived from the network, and refuses revoked keys). It only ever sees ciphertext.
 
