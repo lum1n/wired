@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use iroh::{
     EndpointAddr, PublicKey, TransportAddr,
     endpoint::{Connection, Incoming, RecvStream, SendStream},
@@ -136,25 +136,35 @@ impl Inner {
         }
     }
 
-    /// The key of the member called `node`. A node that joined a moment ago may not have
-    /// reached us yet: the anchor pushes it within moments, so wait briefly for that.
+    /// The key of the member called `node`.
     async fn member(&self, node: &str) -> Result<[u8; 32]> {
+        self.await_state(|s| s.members.get(node).copied()).await.with_context(|| format!("unknown node {node:?}"))
+    }
+
+    /// Whether `name` is registered to `key` in the network state.
+    async fn is_member(&self, name: &str, key: &[u8; 32]) -> bool {
+        self.await_state(|s| (s.members.get(name) == Some(key)).then_some(())).await.is_some()
+    }
+
+    /// Looks something up in the network state. A node that joined a moment ago may not
+    /// have reached us yet: the anchor pushes it within moments, so wait briefly for that.
+    async fn await_state<T>(&self, find: impl Fn(&Snapshot) -> Option<T>) -> Option<T> {
         let deadline = tokio::time::Instant::now() + NAME_WAIT;
         loop {
             // Registered before looking, so a snapshot arriving in between still wakes us.
             let changed = self.snap_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if let Some(key) = self.snapshot().members.get(node) {
-                return Ok(*key);
+            if let Some(found) = find(&self.snapshot()) {
+                return Some(found);
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                bail!("unknown node {node:?}");
+                return None;
             }
         }
     }
 
-    async fn connect_hello(self: &Arc<Self>, id: PublicKey) -> Result<Peer> {
+    pub(crate) async fn connect_hello(self: &Arc<Self>, id: PublicKey) -> Result<Peer> {
         ensure!(id != self.ep.id(), "cannot dial ourselves");
         let addr = EndpointAddr::from_parts(id, self.relay_urls().into_iter().map(TransportAddr::Relay));
         let conn = self.ep.connect(addr, crate::proto::ALPN).await.context("connect")?;
@@ -163,6 +173,11 @@ impl Inner {
         let Reply::Hello { cert: theirs } = reply else { return Err(reply_err(reply)) };
         let snap = self.snapshot();
         cert::verify(&theirs, &self.trust(&snap), id).context("peer presented a bad certificate")?;
+        ensure!(
+            self.is_member(&theirs.body.name, id.as_bytes()).await,
+            "{:?} is not registered to that key",
+            theirs.body.name
+        );
         let peer = Peer { conn: conn.clone(), name: theirs.body.name.clone(), issuer: theirs.body.issuer };
         self.add_peer(conn, peer.name.clone(), peer.issuer);
         Ok(peer)
@@ -187,7 +202,7 @@ impl Inner {
             tokio::time::timeout(REQUEST_TIMEOUT, conn.accept_bi()).await.context("no hello")??;
         let open: Open = frame::read_limited(&mut recv, frame::MAX_UNAUTHENTICATED_FRAME).await?;
         let (reply, peer) = match open {
-            Open::Join { .. } | Open::Hello { .. } => match self.authenticate(&conn, open) {
+            Open::Join { .. } | Open::Hello { .. } => match self.authenticate(&conn, open).await {
                 Ok((reply, name, issuer)) => (reply, Some((name, issuer))),
                 Err(r) => (r.into(), None),
             },
@@ -210,7 +225,7 @@ impl Inner {
     }
 
     /// Handles `Join` or `Hello`; returns the reply, the peer's name and its issuer.
-    fn authenticate(&self, conn: &Connection, open: Open) -> Result<(Reply, String, [u8; 32]), Refusal> {
+    async fn authenticate(&self, conn: &Connection, open: Open) -> Result<(Reply, String, [u8; 32]), Refusal> {
         let own =
             || self.own_cert().map_err(|_| Refusal(ErrorCode::NotApproved, "this anchor is not ready yet".into()));
         match open {
@@ -226,6 +241,11 @@ impl Inner {
                 let snap = self.snapshot();
                 cert::verify(&cert, &self.trust(&snap), conn.remote_id())
                     .map_err(|e| Refusal(ErrorCode::Unauthorized, format!("{e:#}")))?;
+                // An anchor may only certify a name for the key the root registered it to.
+                if !self.is_member(&cert.body.name, &cert.body.node_id).await {
+                    let msg = format!("{:?} is not registered to this key", cert.body.name);
+                    return Err(Refusal(ErrorCode::Unauthorized, msg));
+                }
                 Ok((Reply::Hello { cert: own()? }, cert.body.name, cert.body.issuer))
             }
             _ => Err(Refusal(ErrorCode::Protocol, "expected Join or Hello".into())),
@@ -282,7 +302,7 @@ impl Inner {
                 }
             }
             Open::Watch if self.anchor.is_some() => return self.serve_watch(send, peer.id).await,
-            open @ (Open::Join { .. } | Open::Hello { .. }) => match self.authenticate(conn, open) {
+            open @ (Open::Join { .. } | Open::Hello { .. }) => match self.authenticate(conn, open).await {
                 Ok((reply, _, _)) => reply,
                 Err(r) => r.into(),
             },
@@ -291,5 +311,99 @@ impl Inner {
         frame::write(&mut send, &reply).await?;
         let _ = send.finish();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use iroh::{Endpoint, SecretKey, endpoint::presets};
+
+    use super::*;
+    use crate::{AnchorConfig, Node, proto::Role};
+
+    async fn root() -> Node {
+        let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = AnchorConfig { bind: lo, public_host: Some("127.0.0.1".into()), replica_of: None };
+        Node::builder("root").anchor(cfg).ephemeral().spawn().await.unwrap()
+    }
+
+    /// Presents `cert` from `key` to `node`, and returns its answer.
+    async fn hello(node: &Node, key: &SecretKey, cert: Cert) -> Reply {
+        let ep = Endpoint::builder(presets::Minimal)
+            .secret_key(key.clone())
+            .alpns(vec![crate::proto::ALPN.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(node.id()).with_ip_addr(node.inner.ep.bound_sockets()[0]);
+        let conn = ep.connect(addr, crate::proto::ALPN).await.unwrap();
+        let (_, _, reply) = request(&conn, &Open::Hello { version: PROTOCOL_VERSION, cert }).await.unwrap();
+        ep.close().await;
+        reply
+    }
+
+    /// An anchor (here the root itself) certifying a name for a key the name isn't registered to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hello_refuses_a_certificate_whose_name_belongs_to_another_key() {
+        let root = root().await;
+        let alice = Node::builder("alice").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let (issuer, net) = (root.inner.ep.secret_key(), root.inner.network_id);
+        let mallory = SecretKey::generate();
+        let forged = cert::issue(issuer, None, net, mallory.public(), "alice", Role::Member);
+        let reply = hello(&root, &mallory, forged).await;
+        assert!(matches!(reply, Reply::Error { code: ErrorCode::Unauthorized, .. }), "{reply:?}");
+        // The same check passes for the key the name is registered to.
+        let real = cert::issue(issuer, None, net, alice.id(), "alice", Role::Member);
+        let alice_key = alice.inner.ep.secret_key().clone();
+        alice.close().await;
+        assert!(matches!(hello(&root, &alice_key, real).await, Reply::Hello { .. }));
+        root.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn members_take_only_newer_snapshots_the_root_signed() {
+        let root = root().await;
+        let bob = Node::builder("bob").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let laptop = Node::builder("laptop").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let synced = |n: &Node| n.inner.snapshot().version == root.inner.snapshot().version;
+        for _ in 0..100 {
+            if synced(&laptop) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(synced(&laptop));
+        let before = laptop.inner.snapshot();
+
+        // A replica can't forge state: a changed or unsigned snapshot is ignored, at any version.
+        let mut forged = (*before).clone();
+        forged.version = u64::MAX;
+        forged.denied.clear();
+        laptop.inner.apply_snapshot(forged.clone()).await;
+        forged.sig.clear();
+        laptop.inner.apply_snapshot(forged).await;
+        assert_eq!(laptop.inner.snapshot(), before);
+
+        // Nor replay an older one the root signed, to undo a revocation.
+        root.revoke("bob").unwrap();
+        for _ in 0..100 {
+            if synced(&laptop) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let after = laptop.inner.snapshot();
+        assert!(after.denied.contains(bob.id().as_bytes()));
+        laptop.inner.apply_snapshot((*before).clone()).await;
+        assert_eq!(laptop.inner.snapshot(), after);
+
+        for n in [bob, laptop, root] {
+            n.close().await;
+        }
     }
 }

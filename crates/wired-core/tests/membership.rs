@@ -247,3 +247,48 @@ async fn admin_socket_and_root_restart() {
     vps.close().await;
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_restored_from_older_state_catches_up_from_its_replica() {
+    init_logs();
+    let dir = temp_dir("restore");
+    let spawn_root = || Node::builder("vps").anchor(local_anchor(None)).state_dir(&dir).spawn();
+    let vps = spawn_root().await.unwrap();
+    let vps2 = Node::builder("vps2")
+        .anchor(local_anchor(Some(vps.invite().parse().unwrap())))
+        .ephemeral()
+        .spawn()
+        .await
+        .unwrap();
+    vps.approve_anchor(vps2.id()).unwrap();
+    assert!(eventually(20, || vps.members().iter().any(|m| m.name == "vps2" && m.anchor)).await);
+    let eve_key = SecretKey::generate();
+    let eve = member_with_key("eve", &vps.invite(), &eve_key).await.unwrap();
+    let bob = member("bob", &vps.invite()).await.unwrap();
+    let knows = |n: &Node, name: &str| n.members().iter().any(|m| m.name == name);
+    assert!(eventually(10, || knows(&vps2, "eve") && knows(&vps2, "bob")).await);
+
+    // Back up the root's state, then revoke eve.
+    let state = wired_core::state::anchor_path(&dir);
+    let backup = std::fs::read(&state).unwrap();
+    vps.revoke("eve").unwrap();
+    assert!(eventually(10, || !knows(&vps2, "eve")).await, "the replica never applied the revocation");
+    eve.close().await;
+
+    // Restore the backup and restart the root: it takes the newer state from its replica.
+    vps.close().await;
+    std::fs::write(&state, backup).unwrap();
+    let vps = spawn_root().await.unwrap();
+    assert!(!knows(&vps, "eve"), "the restored root forgot eve's revocation");
+    let again = member_with_key("eve", &vps.invite(), &eve_key).await.unwrap_err();
+    assert_eq!(code(&again), Some(ErrorCode::Denied), "{again:#}");
+
+    // And its decisions reach the network.
+    vps.revoke("bob").unwrap();
+    assert!(eventually(20, || !knows(&vps2, "bob")).await, "the replica ignored the restarted root");
+
+    for n in [bob, vps2, vps] {
+        n.close().await;
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

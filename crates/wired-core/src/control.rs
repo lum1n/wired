@@ -134,12 +134,16 @@ impl Inner {
         Ok(theirs)
     }
 
-    /// Applies a snapshot pushed by an anchor, if it is newer than ours.
+    /// Applies a snapshot pushed by an anchor, if the root signed it and it is newer than ours.
     pub(crate) async fn apply_snapshot(&self, mut snap: Snapshot) {
         let secret = snap.secret.take();
+        if let Err(e) = snap.verify(&self.root) {
+            warn!("ignoring a snapshot the root did not sign: {e:#}");
+            return;
+        }
         let snap = {
             let mut cur = self.snap.write().unwrap();
-            if snap.version < cur.version || (snap.version == cur.version && snap == **cur) {
+            if snap.version <= cur.version {
                 return;
             }
             *cur = Arc::new(snap);

@@ -4,20 +4,24 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     cert, frame,
     invite::{AnchorInfo, NetworkSecret, RelayInfo},
     node::{Inner, Node, valid_name},
-    peer::Refusal,
-    proto::{Cert, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, PROTOCOL_VERSION, Reply, Role, Snapshot},
+    peer::{Refusal, reply_err, request},
+    proto::{Cert, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, Open, PROTOCOL_VERSION, Reply, Role, Snapshot},
     relay::{self, same_url},
 };
 use anyhow::{Result, bail, ensure};
-use iroh::{PublicKey, endpoint::Connection, endpoint::SendStream};
+use iroh::{PublicKey, SecretKey, endpoint::Connection, endpoint::SendStream};
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{debug, warn};
+
+/// How long a restarted root waits for the other anchors' snapshots.
+const CATCH_UP: Duration = Duration::from_secs(5);
 
 pub(crate) struct AnchorState {
     /// How to reach this anchor; published in the snapshot.
@@ -42,7 +46,7 @@ impl Inner {
             if !change(&mut next) {
                 return;
             }
-            next.version += 1;
+            seal(&mut next, self.ep.secret_key());
             *guard = Arc::new(next);
             guard.clone()
         };
@@ -188,6 +192,44 @@ impl Inner {
         }
     }
 
+    /// Root restarted from saved state: asks the other anchors for the newest
+    /// snapshot this root signed, in case the saved state is older (restored
+    /// from a backup, or a save failed). Returns it if it is newer than `since`.
+    pub(crate) async fn newest_from_anchors(self: &Arc<Self>, since: u64) -> Option<Snapshot> {
+        let me = self.ep.id();
+        let mut asks = tokio::task::JoinSet::new();
+        for a in &self.snapshot().anchors {
+            let Ok(id) = PublicKey::from_bytes(&a.id) else { continue };
+            if id == me {
+                continue;
+            }
+            let inner = self.clone();
+            asks.spawn(async move { (id, tokio::time::timeout(CATCH_UP, inner.fetch_snapshot(id)).await) });
+        }
+        let mut newest: Option<Snapshot> = None;
+        while let Some(Ok((id, res))) = asks.join_next().await {
+            match res {
+                Ok(Ok(s)) if s.version > newest.as_ref().map_or(since, |n| n.version) => newest = Some(s),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!(anchor = %id.fmt_short(), "no snapshot from anchor: {e:#}"),
+                Err(_) => debug!(anchor = %id.fmt_short(), "no snapshot from anchor: timed out"),
+            }
+        }
+        newest
+    }
+
+    /// The snapshot an anchor holds, checked to be one the root signed.
+    async fn fetch_snapshot(self: &Arc<Self>, id: PublicKey) -> Result<Snapshot> {
+        let peer = match self.live_peer(id) {
+            Some(p) => p,
+            None => self.connect_hello(id).await?,
+        };
+        let (_send, _recv, reply) = request(&peer.conn, &Open::Watch).await?;
+        let Reply::State(snap) = reply else { return Err(reply_err(reply)) };
+        snap.verify(&self.root)?;
+        Ok(snap)
+    }
+
     /// Root: re-signs its own anchor certificate at half its lifetime.
     pub(crate) async fn renew_root_loop(self: Arc<Self>) {
         loop {
@@ -201,6 +243,16 @@ impl Inner {
     fn rotate_secret(&self) {
         *self.secret.write().unwrap() = NetworkSecret::generate();
     }
+}
+
+/// Root: moves `snap` to a new version and signs it. Versions are at least the
+/// clock in Unix milliseconds, so a root restarted from older state still
+/// outranks every snapshot it published before.
+pub(crate) fn seal(snap: &mut Snapshot, root: &SecretKey) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    snap.version = (snap.version + 1).max(now);
+    snap.secret = None;
+    snap.sign(root);
 }
 
 fn not_approved(key: PublicKey) -> Refusal {

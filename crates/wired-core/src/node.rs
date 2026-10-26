@@ -579,8 +579,8 @@ impl Inner {
         let Some(dir) = &self.dir else { return };
         let snapshot = (*self.snapshot()).clone();
         let res = match &self.anchor {
-            Some(a) => state::save(
-                &state::anchor_path(dir),
+            Some(a) => state::save_anchor(
+                dir,
                 &AnchorDisk {
                     network_id: self.network_id,
                     root: *self.root.as_bytes(),
@@ -592,8 +592,9 @@ impl Inner {
             )
             .and_then(|()| state::save_invite(dir, &self.invite().encode())),
             None => match self.cert.read().unwrap().clone() {
-                Some(cert) => state::save(
-                    &state::member_path(dir, &self.name),
+                Some(cert) => state::save_member(
+                    dir,
+                    &self.name,
                     &MemberDisk { network_id: self.network_id, root: *self.root.as_bytes(), cert, snapshot },
                 ),
                 None => Ok(()),
@@ -793,12 +794,13 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
     };
     let root = PublicKey::from_bytes(&invite.root).map_err(|e| anyhow!("bad root key in invite: {e}"))?;
     let disk = match &dir {
-        Some(d) => state::load::<MemberDisk>(&state::member_path(d, &b.name))?
-            .filter(|m| m.network_id == invite.network_id && m.root == invite.root),
+        Some(d) => {
+            state::load_member(d, &b.name)?.filter(|m| m.network_id == invite.network_id && m.root == invite.root)
+        }
         None => None,
     };
     let (cert, mut snap) = match disk {
-        Some(d) if d.cert.body.node_id == *key.public().as_bytes() => (Some(d.cert), d.snapshot),
+        Some(d) if d.cert.body.node_id == *key.public().as_bytes() => (Some(d.cert), cached(d.snapshot)),
         _ => (None, Snapshot::default()),
     };
     snap.anchors = merge(snap.anchors, &invite.anchors, |a| a.id);
@@ -845,9 +847,10 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
 
 async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option<PathBuf>) -> Result<Node> {
     let disk = match &dir {
-        Some(d) => state::load::<AnchorDisk>(&state::anchor_path(d))?,
+        Some(d) => state::load_anchor(d)?,
         None => None,
     };
+    let saved_version = disk.as_ref().map(|d| d.snapshot.version);
     let me = *key.public().as_bytes();
     let (network_id, root, secret, snap, approved, cert) = match (&cfg.replica_of, disk) {
         (None, Some(d)) => {
@@ -856,10 +859,11 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         }
         (None, None) => (rand::random(), me, NetworkSecret::generate(), Snapshot::default(), BTreeSet::new(), None),
         (Some(inv), Some(d)) if d.network_id == inv.network_id && d.root == inv.root => {
+            let snap = cached(d.snapshot);
             let snap = Snapshot {
-                anchors: merge(d.snapshot.anchors.clone(), &inv.anchors, |a| a.id),
-                relays: merge(d.snapshot.relays.clone(), &inv.relays, |r| norm_url(&r.url)),
-                ..d.snapshot
+                anchors: merge(snap.anchors.clone(), &inv.anchors, |a| a.id),
+                relays: merge(snap.relays.clone(), &inv.relays, |r| norm_url(&r.url)),
+                ..snap
             };
             (d.network_id, d.root, d.secret, snap, BTreeSet::new(), d.cert)
         }
@@ -886,34 +890,34 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         info.addrs.push(format!("{}:{}", relay::url_host(&host), socket.port()));
     }
 
-    let mut snap = snap;
-    let cert = if is_root {
-        if let Some(owner) = snap.members.get(&b.name)
-            && *owner != me
-        {
-            bail!("name {:?} belongs to another key in this network", b.name);
-        }
-        let mut next = snap.clone();
-        next.members.retain(|_, k| *k != me);
-        next.members.insert(b.name.clone(), me);
-        next.anchors.retain(|a| a.id != me);
-        next.anchors.insert(0, info.clone());
-        // Our own relay replaces whatever we served last time.
-        next.relays.retain(|r| r.owner != Some(me));
-        next.relays.extend(own_relay);
-        if next != snap {
-            next.version += 1;
-            snap = next;
-        }
-        Some(cert::issue(&key, None, network_id, key.public(), &b.name, Role::Anchor))
+    let (snap, cert) = if is_root {
+        let snap = root_start(&snap, &key, &b.name, &info, &own_relay)?;
+        (snap, Some(cert::issue(&key, None, network_id, key.public(), &b.name, Role::Anchor)))
     } else {
-        cert
+        (snap, cert)
     };
 
     let (updates, _) = watch::channel(Arc::new(snap.clone()));
-    let anchor = AnchorState { info, approved: Mutex::new(approved), updates };
+    let anchor = AnchorState { info: info.clone(), approved: Mutex::new(approved), updates };
     let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, Some(anchor), relay, dir.clone());
     inner.learn_network(&inner.snapshot()).await;
+    if is_root
+        && let Some(since) = saved_version
+        && let Some(newer) = inner.newest_from_anchors(since).await
+    {
+        // The saved state is older than what the network has: carry on from the newest.
+        match root_start(&newer, &key, &inner.name, &info, &own_relay) {
+            Ok(next) => {
+                warn!(saved = since, network = newer.version, "saved state was behind the network; caught up");
+                if let Some(secret) = newer.secret {
+                    *inner.secret.write().unwrap() = secret;
+                }
+                *inner.snap.write().unwrap() = Arc::new(next);
+                inner.snapshot_changed(inner.snapshot());
+            }
+            Err(e) => warn!("saved state is behind the network, but cannot catch up: {e:#}"),
+        }
+    }
     if let Some(r) = &inner.relay {
         *r.denied.write().unwrap() = inner.snapshot().denied.clone();
     }
@@ -939,6 +943,42 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         node.inner.tasks.lock().unwrap().push(handle);
     }
     Ok(node)
+}
+
+/// A snapshot from a node's saved state. One the root never signed (saved before snapshots
+/// were signed) gets version 0, so the next snapshot the root signs replaces it.
+fn cached(mut snap: Snapshot) -> Snapshot {
+    if snap.sig.is_empty() {
+        snap.version = 0;
+    }
+    snap
+}
+
+/// The root's snapshot as it starts: registered under its name, with its current
+/// address and relay, at a new version and signed.
+fn root_start(
+    snap: &Snapshot,
+    key: &SecretKey,
+    name: &str,
+    info: &AnchorInfo,
+    own_relay: &[RelayInfo],
+) -> Result<Snapshot> {
+    let me = *key.public().as_bytes();
+    if let Some(owner) = snap.members.get(name)
+        && *owner != me
+    {
+        bail!("name {name:?} belongs to another key in this network");
+    }
+    let mut next = snap.clone();
+    next.members.retain(|_, k| *k != me);
+    next.members.insert(name.to_string(), me);
+    next.anchors.retain(|a| a.id != me);
+    next.anchors.insert(0, info.clone());
+    // Our own relay replaces whatever we served last time.
+    next.relays.retain(|r| r.owner != Some(me));
+    next.relays.extend(own_relay.iter().cloned());
+    crate::anchor::seal(&mut next, key);
+    Ok(next)
 }
 
 /// The IP of the interface holding the default route. Sends no packets.

@@ -1,7 +1,7 @@
 //! On-disk state: node keys, the anchor's network secret and name registry.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -12,9 +12,12 @@ use iroh::SecretKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    invite::NetworkSecret,
+    invite::{AnchorInfo, NetworkSecret, RelayInfo},
     proto::{Cert, Snapshot},
 };
+
+/// Starts every node state file since snapshots are signed. Older files have no header.
+const FORMAT: &[u8] = b"wired-state/2\n";
 
 /// `$XDG_CONFIG_HOME/wired`, falling back to `~/.config/wired`.
 pub fn default_dir() -> PathBuf {
@@ -63,17 +66,41 @@ pub fn load_or_create_key(dir: &Path, name: &str) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&b))
 }
 
-/// Reads a postcard file; `None` if it does not exist.
-pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path) {
-        Ok(b) => Ok(Some(postcard::from_bytes(&b).with_context(|| format!("parse {}", path.display()))?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
+/// Reads a node state file, converting one in the format before snapshots were signed.
+/// `None` if it does not exist.
+fn load_state<T: DeserializeOwned, Old: DeserializeOwned + Into<T>>(path: &Path) -> Result<Option<T>> {
+    let b = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let parsed = match b.strip_prefix(FORMAT) {
+        Some(rest) => postcard::from_bytes(rest),
+        None => postcard::from_bytes::<Old>(&b).map(Into::into),
+    };
+    Ok(Some(parsed.with_context(|| format!("parse {}", path.display()))?))
 }
 
-pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_private(path, &postcard::to_stdvec(value)?)
+fn save_state<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut data = FORMAT.to_vec();
+    data.extend(postcard::to_stdvec(value)?);
+    write_private(path, &data)
+}
+
+pub fn load_anchor(dir: &Path) -> Result<Option<AnchorDisk>> {
+    load_state::<AnchorDisk, OldAnchorDisk>(&anchor_path(dir))
+}
+
+pub fn save_anchor(dir: &Path, disk: &AnchorDisk) -> Result<()> {
+    save_state(&anchor_path(dir), disk)
+}
+
+pub fn load_member(dir: &Path, name: &str) -> Result<Option<MemberDisk>> {
+    load_state::<MemberDisk, OldMemberDisk>(&member_path(dir, name))
+}
+
+pub fn save_member(dir: &Path, name: &str, disk: &MemberDisk) -> Result<()> {
+    save_state(&member_path(dir, name), disk)
 }
 
 pub fn anchor_path(dir: &Path) -> PathBuf {
@@ -125,6 +152,60 @@ pub struct MemberDisk {
     pub snapshot: Snapshot,
 }
 
+// The format before snapshots were signed. Its snapshots load unsigned.
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct OldSnapshot {
+    version: u64,
+    members: BTreeMap<String, [u8; 32]>,
+    denied: BTreeSet<[u8; 32]>,
+    anchors: Vec<AnchorInfo>,
+    relays: Vec<RelayInfo>,
+    secret: Option<NetworkSecret>,
+}
+
+impl From<OldSnapshot> for Snapshot {
+    fn from(o: OldSnapshot) -> Self {
+        let OldSnapshot { version, members, denied, anchors, relays, secret } = o;
+        Snapshot { version, members, denied, anchors, relays, secret, sig: Vec::new() }
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct OldAnchorDisk {
+    network_id: [u8; 16],
+    root: [u8; 32],
+    secret: NetworkSecret,
+    snapshot: OldSnapshot,
+    approved: BTreeSet<[u8; 32]>,
+    cert: Option<Cert>,
+}
+
+impl From<OldAnchorDisk> for AnchorDisk {
+    fn from(o: OldAnchorDisk) -> Self {
+        let OldAnchorDisk { network_id, root, secret, snapshot, approved, cert } = o;
+        AnchorDisk { network_id, root, secret, snapshot: snapshot.into(), approved, cert }
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct OldMemberDisk {
+    network_id: [u8; 16],
+    root: [u8; 32],
+    cert: Cert,
+    snapshot: OldSnapshot,
+}
+
+impl From<OldMemberDisk> for MemberDisk {
+    fn from(o: OldMemberDisk) -> Self {
+        let OldMemberDisk { network_id, root, cert, snapshot } = o;
+        MemberDisk { network_id, root, cert, snapshot: snapshot.into() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +222,35 @@ mod tests {
             let mode = fs::metadata(dir.join("n.key")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn state_saved_before_snapshots_were_signed_still_loads() {
+        let dir = std::env::temp_dir().join(format!("wired-state-{}", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        let cert = crate::cert::issue(&key, None, [1; 16], key.public(), "laptop", crate::proto::Role::Member);
+        let old = OldMemberDisk {
+            network_id: [1; 16],
+            root: *key.public().as_bytes(),
+            cert: cert.clone(),
+            snapshot: OldSnapshot {
+                version: 7,
+                members: [("laptop".to_string(), *key.public().as_bytes())].into(),
+                denied: [[2; 32]].into(),
+                anchors: Vec::new(),
+                relays: Vec::new(),
+                secret: None,
+            },
+        };
+        write_private(&member_path(&dir, "laptop"), &postcard::to_stdvec(&old).unwrap()).unwrap();
+        let disk = load_member(&dir, "laptop").unwrap().unwrap();
+        assert_eq!((&disk.cert, disk.snapshot.version, disk.snapshot.sig.len()), (&cert, 7, 0));
+        assert!(disk.snapshot.denied.contains(&[2; 32]));
+        // Saved again, it is in the new format.
+        save_member(&dir, "laptop", &disk).unwrap();
+        assert!(fs::read(member_path(&dir, "laptop")).unwrap().starts_with(FORMAT));
+        assert_eq!(load_member(&dir, "laptop").unwrap().unwrap().snapshot, disk.snapshot);
         fs::remove_dir_all(dir).ok();
     }
 }

@@ -1,6 +1,8 @@
-# Wired protocol, version 1
+# Wired protocol, version 2
 
 This document is normative for every Wired implementation and binding.
+
+`Join` and `Hello` carry the protocol version, 2. A node refuses any other version with `BadVersion`. Version 2 added the root's signature to snapshots, so every node in a network must run it. The ALPN, signature contexts and invite format still say `wired/1`; they did not change.
 
 ## Transport
 
@@ -107,22 +109,26 @@ On success, the reply is `Reply::Joined { cert, anchor }`, where `anchor` is the
 ## Network state
 
 ```
-Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], relays: [RelayInfo], secret }
+Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], relays: [RelayInfo], secret, sig }
+sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secret = None, sig = []))
 ```
 
-- The root owns the snapshot and increments `version` on every change.
+- The root owns the snapshot. On every change it sets `version = max(version + 1, now in Unix milliseconds)` and signs it. Versions never go back, even when the root restarts from older saved state.
+- Other anchors pass the snapshot on unchanged. They can't alter it.
 - A node sends `Open::Watch` to an anchor. The anchor sends `Reply::State(snapshot)` immediately, and again on every change, for as long as the stream stays open.
 - `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`.
-- Nodes ignore snapshots older than the one they have.
+- A node takes a snapshot only if `sig` verifies under the root key and `version` is higher than the one it has. Anything else is ignored.
 - Each member and replica keeps one Watch session open:
   - It starts attempts at anchors root first, 2 seconds apart, and keeps the first that succeeds.
   - When attached to a replica, it goes back to the root every 5 minutes.
   - It reconnects with backoff from 1 to 30 seconds.
 - Names resolve locally from `members`. There is no lookup request.
+- A root that starts from saved state first asks the other anchors (`Watch`, waiting at most 5 seconds) for their snapshot. If one it signed is newer than its own, it continues from that one, so revocations made after a backup survive a restore.
 
 ## Peer connections
 
-- The first stream between two nodes is `Open::Hello { cert }`. The acceptor checks the certificate and replies `Reply::Hello { cert }` with its own.
+- The first stream between two nodes is `Open::Hello { version, cert }`. The acceptor checks the certificate and replies `Reply::Hello { cert }` with its own.
+- Both sides also check that `members` maps the certificate's name to the peer's key, waiting up to 2 seconds for a node that just joined. Otherwise the acceptor refuses with `Unauthorized`. So an anchor can't certify a name for another key.
 - Both sides must reject any other stream on the connection until this exchange has finished.
 - The dialer must check that the peer's certificate carries the name it dialed.
 

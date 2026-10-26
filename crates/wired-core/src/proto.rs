@@ -8,12 +8,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::{Context, Result};
+use iroh::{PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::invite::{AnchorInfo, NetworkSecret, RelayInfo};
 
 pub const ALPN: &[u8] = b"wired/1";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Label for the TLS exporter that binds a join proof to its QUIC session.
 pub const JOIN_EXPORTER_LABEL: &[u8] = b"wired/1 join";
@@ -21,6 +23,8 @@ pub const JOIN_EXPORTER_LABEL: &[u8] = b"wired/1 join";
 pub const JOIN_MAC_CONTEXT: &[u8] = b"wired/1 join-proof";
 /// Domain-separation prefix for certificate signatures.
 pub const CERT_SIG_CONTEXT: &[u8] = b"wired/1 cert";
+/// Domain-separation prefix for the root's signature on a snapshot.
+pub const SNAPSHOT_SIG_CONTEXT: &[u8] = b"wired/1 snapshot";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -52,10 +56,12 @@ pub struct Cert {
 }
 
 /// The network's shared state, owned by the root anchor and replicated to
-/// every anchor and member.
+/// every anchor and member. The root signs it, so other anchors can only pass it on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// Increases on every change; nodes ignore snapshots older than what they have.
+    /// Increases on every change, and never goes back even if the root is
+    /// restored from older state: at least the root's clock in Unix milliseconds.
+    /// Nodes only take a snapshot newer than the one they have.
     pub version: u64,
     /// Name → key of every member, anchors included.
     pub members: BTreeMap<String, [u8; 32]>,
@@ -65,8 +71,11 @@ pub struct Snapshot {
     pub anchors: Vec<AnchorInfo>,
     /// Every relay. Nodes connect to all of them as needed.
     pub relays: Vec<RelayInfo>,
-    /// Current join secret; only sent to anchors.
+    /// Current join secret; only sent to anchors. Not covered by `sig`.
     pub secret: Option<NetworkSecret>,
+    /// The root's Ed25519 signature over `SNAPSHOT_SIG_CONTEXT ‖ postcard(snapshot)`,
+    /// encoded with `secret` and `sig` empty. Empty on a snapshot the root never signed.
+    pub sig: Vec<u8>,
 }
 
 impl Snapshot {
@@ -76,6 +85,25 @@ impl Snapshot {
 
     pub fn name_of(&self, key: &[u8; 32]) -> Option<&str> {
         self.members.iter().find(|(_, k)| *k == key).map(|(n, _)| n.as_str())
+    }
+
+    fn signed_bytes(&self) -> Vec<u8> {
+        let unsigned = Snapshot { secret: None, sig: Vec::new(), ..self.clone() };
+        let mut msg = SNAPSHOT_SIG_CONTEXT.to_vec();
+        msg.extend(postcard::to_stdvec(&unsigned).expect("snapshot serializes"));
+        msg
+    }
+
+    /// Root: signs the snapshot as it is now.
+    pub fn sign(&mut self, root: &SecretKey) {
+        self.sig = root.sign(&self.signed_bytes()).to_bytes().to_vec();
+    }
+
+    /// Checks that the root signed this snapshot.
+    pub fn verify(&self, root: &PublicKey) -> Result<()> {
+        let sig: &[u8; 64] = self.sig.as_slice().try_into().context("snapshot is not signed")?;
+        root.verify(&self.signed_bytes(), &Signature::from_bytes(sig)).context("bad snapshot signature")?;
+        Ok(())
     }
 }
 
