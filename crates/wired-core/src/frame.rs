@@ -33,8 +33,12 @@ pub async fn read_limited<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R, 
     if len > max {
         bail!("frame too large: {len} bytes");
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await.context("read frame body")?;
+    // Grows as bytes arrive, so a peer can't make us allocate a frame it never sends.
+    let mut buf = Vec::new();
+    (&mut *r).take(len as u64).read_to_end(&mut buf).await.context("read frame body")?;
+    if buf.len() != len {
+        bail!("read frame body: early eof");
+    }
     postcard::from_bytes(&buf).context("decode frame")
 }
 
@@ -48,6 +52,15 @@ mod tests {
         write(&mut a, &("hello".to_string(), 42u32)).await.unwrap();
         let got: (String, u32) = read(&mut b).await.unwrap();
         assert_eq!(got, ("hello".to_string(), 42));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_frame_shorter_than_its_length() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        a.write_all(&(MAX_FRAME as u32).to_be_bytes()).await.unwrap();
+        a.write_all(b"short").await.unwrap();
+        drop(a);
+        assert!(read::<_, u32>(&mut b).await.is_err());
     }
 
     #[tokio::test]

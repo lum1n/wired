@@ -2,7 +2,7 @@
 //! state, pushing it to watchers, and the admin operations.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +22,8 @@ use tracing::{debug, warn};
 
 /// How long a restarted root waits for the other anchors' snapshots.
 const CATCH_UP: Duration = Duration::from_secs(5);
+/// Watch streams one peer may hold open at once. A node needs one.
+pub(crate) const MAX_WATCHES: usize = 4;
 
 pub(crate) struct AnchorState {
     /// How to reach this anchor; published in the snapshot.
@@ -30,6 +32,8 @@ pub(crate) struct AnchorState {
     pub(crate) approved: Mutex<BTreeSet<[u8; 32]>>,
     /// Latest snapshot, for `Watch` streams.
     pub(crate) updates: watch::Sender<Arc<Snapshot>>,
+    /// Open `Watch` streams per peer.
+    pub(crate) watches: Mutex<HashMap<PublicKey, usize>>,
 }
 
 impl Inner {
@@ -124,7 +128,8 @@ impl Inner {
                     if !approved(&rk) {
                         return Err(not_approved(remote));
                     }
-                    self.update_snapshot(|s| upsert_anchor(s, info));
+                    // Checked again under the lock: a revoke may have removed the key since.
+                    self.update_snapshot(|s| s.name_of(&rk).is_some() && upsert_anchor(s, info));
                 }
             }
             None => {
@@ -165,7 +170,8 @@ impl Inner {
         // A member serving a relay: list it, owned by that member. Only the
         // root changes the network; elsewhere the member re-announces later.
         if root && let Some(r) = relay {
-            self.update_snapshot(|s| list_member_relay(s, r));
+            // Checked again under the lock: a revoke may have removed the key since.
+            self.update_snapshot(|s| s.name_of(&rk).is_some() && list_member_relay(s, r));
         }
 
         let role = if root && self.snapshot().is_anchor(&rk) { Role::Anchor } else { Role::Member };
@@ -178,6 +184,10 @@ impl Inner {
 
     /// Streams the network state to a watcher, once now and again on every change.
     pub(crate) async fn serve_watch(&self, mut send: SendStream, peer: PublicKey) -> Result<()> {
+        let Some(_watch) = WatchSlot::take(&self.anchor_state().watches, peer) else {
+            let refusal = Refusal(ErrorCode::Protocol, format!("at most {MAX_WATCHES} watches per node"));
+            return frame::write(&mut send, &Reply::from(refusal)).await;
+        };
         let mut rx = self.anchor_state().updates.subscribe();
         loop {
             let snap = rx.borrow_and_update().clone();
@@ -188,7 +198,11 @@ impl Inner {
             if snap.denied.contains(peer.as_bytes()) {
                 return Ok(());
             }
-            rx.changed().await?;
+            tokio::select! {
+                changed = rx.changed() => changed?,
+                // The watcher went away; don't hold its place until the next change.
+                _ = send.stopped() => return Ok(()),
+            }
         }
     }
 
@@ -253,6 +267,36 @@ pub(crate) fn seal(snap: &mut Snapshot, root: &SecretKey) {
     snap.version = (snap.version + 1).max(now);
     snap.secret = None;
     snap.sign(root);
+}
+
+/// One of a peer's `MAX_WATCHES` watch streams, given back when dropped.
+struct WatchSlot<'a> {
+    watches: &'a Mutex<HashMap<PublicKey, usize>>,
+    peer: PublicKey,
+}
+
+impl<'a> WatchSlot<'a> {
+    fn take(watches: &'a Mutex<HashMap<PublicKey, usize>>, peer: PublicKey) -> Option<Self> {
+        let mut map = watches.lock().unwrap();
+        let n = map.entry(peer).or_default();
+        if *n >= MAX_WATCHES {
+            return None;
+        }
+        *n += 1;
+        Some(Self { watches, peer })
+    }
+}
+
+impl Drop for WatchSlot<'_> {
+    fn drop(&mut self) {
+        let mut map = self.watches.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.peer);
+            }
+        }
+    }
 }
 
 fn not_approved(key: PublicKey) -> Refusal {

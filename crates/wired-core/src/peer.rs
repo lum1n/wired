@@ -200,7 +200,10 @@ impl Inner {
         let conn = incoming.await?;
         let (mut send, mut recv) =
             tokio::time::timeout(REQUEST_TIMEOUT, conn.accept_bi()).await.context("no hello")??;
-        let open: Open = frame::read_limited(&mut recv, frame::MAX_UNAUTHENTICATED_FRAME).await?;
+        let open: Open =
+            tokio::time::timeout(REQUEST_TIMEOUT, frame::read_limited(&mut recv, frame::MAX_UNAUTHENTICATED_FRAME))
+                .await
+                .context("no hello")??;
         let (reply, peer) = match open {
             Open::Join { .. } | Open::Hello { .. } => match self.authenticate(&conn, open).await {
                 Ok((reply, name, issuer)) => (reply, Some((name, issuer))),
@@ -283,7 +286,8 @@ impl Inner {
             conn.close(2u32.into(), b"revoked");
             return Ok(());
         }
-        let open: Open = frame::read(&mut recv).await?;
+        let open: Open =
+            tokio::time::timeout(REQUEST_TIMEOUT, frame::read(&mut recv)).await.context("no request")??;
         let reply = match open {
             Open::Service { name } => {
                 let found = self.services.lock().unwrap().get(&name).map(|s| (s.tx.clone(), s.allow.clone()));
@@ -362,6 +366,35 @@ mod tests {
         let alice_key = alice.inner.ep.secret_key().clone();
         alice.close().await;
         assert!(matches!(hello(&root, &alice_key, real).await, Reply::Hello { .. }));
+        root.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_anchor_limits_the_watches_one_node_holds() {
+        let root = root().await;
+        let laptop = Node::builder("laptop").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let conn = laptop.inner.live_peer(root.id()).expect("laptop is connected to the root").conn;
+        // The laptop's control session holds one already.
+        let mut held = Vec::new();
+        for _ in 1..crate::anchor::MAX_WATCHES {
+            let (send, recv, reply) = request(&conn, &Open::Watch).await.unwrap();
+            assert!(matches!(reply, Reply::State(_)), "{reply:?}");
+            held.push((send, recv));
+        }
+        let (_, _, reply) = request(&conn, &Open::Watch).await.unwrap();
+        assert!(matches!(reply, Reply::Error { code: ErrorCode::Protocol, .. }), "{reply:?}");
+        // Closing one frees its place.
+        drop(held.pop());
+        let mut freed = false;
+        for _ in 0..50 {
+            if let (_, _, Reply::State(_)) = request(&conn, &Open::Watch).await.unwrap() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed);
+        laptop.close().await;
         root.close().await;
     }
 

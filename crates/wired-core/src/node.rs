@@ -758,6 +758,10 @@ fn new_inner(
     relay: Option<ServedRelay>,
     dir: Option<PathBuf>,
 ) -> Arc<Inner> {
+    // The relay this node serves refuses revoked keys from the start, not from the next snapshot.
+    if let Some(r) = &relay {
+        *r.denied.write().unwrap() = snap.denied.clone();
+    }
     Arc::new_cyclic(|me| Inner {
         me: me.clone(),
         rt: tokio::runtime::Handle::current(),
@@ -898,7 +902,8 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     };
 
     let (updates, _) = watch::channel(Arc::new(snap.clone()));
-    let anchor = AnchorState { info: info.clone(), approved: Mutex::new(approved), updates };
+    let anchor =
+        AnchorState { info: info.clone(), approved: Mutex::new(approved), updates, watches: Default::default() };
     let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, Some(anchor), relay, dir.clone());
     inner.learn_network(&inner.snapshot()).await;
     if is_root
@@ -917,9 +922,6 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
             }
             Err(e) => warn!("saved state is behind the network, but cannot catch up: {e:#}"),
         }
-    }
-    if let Some(r) = &inner.relay {
-        *r.denied.write().unwrap() = inner.snapshot().denied.clone();
     }
     inner.persist();
     inner.spawn(inner.clone().accept_loop());
