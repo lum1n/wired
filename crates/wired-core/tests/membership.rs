@@ -217,6 +217,45 @@ async fn member_starts_from_cache_when_no_anchor_is_reachable() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn member_with_an_expired_certificate_rejoins_with_its_old_invite() {
+    init_logs();
+    let vps = root("vps").await;
+    let old_invite = vps.invite();
+    let dir = temp_dir("expired");
+    let spawn_laptop = |invite: &str| Node::builder("laptop").invite(invite.parse().unwrap()).state_dir(&dir).spawn();
+    let laptop = spawn_laptop(&old_invite).await.unwrap();
+    let id = laptop.id();
+    let desktop = member("desktop", &old_invite).await.unwrap();
+    serve_echo(&desktop, "echo", None);
+    laptop.close().await;
+
+    // Laptop stays offline past its certificate while a revocation rotates the secret.
+    let other = member("other", &old_invite).await.unwrap();
+    let new_invite = vps.revoke("other").unwrap();
+    assert_ne!(new_invite, old_invite);
+    let mut disk = wired_core::state::load_member(&dir, "laptop").unwrap().unwrap();
+    disk.cert.body.expires = 1;
+    wired_core::state::save_member(&dir, "laptop", &disk).unwrap();
+
+    // Its key is still registered, so it renews without the (now stale) secret.
+    let laptop = tokio::time::timeout(Duration::from_secs(30), spawn_laptop(&old_invite))
+        .await
+        .expect("rejoin hung")
+        .expect("member with an expired certificate could not rejoin");
+    assert_eq!(laptop.id(), id);
+    echo(&laptop, "echo@desktop").await.unwrap();
+
+    // The old invite still adds no new keys.
+    let stranger = member("stranger", &old_invite).await.unwrap_err();
+    assert_eq!(code(&stranger), Some(ErrorCode::Unauthorized), "{stranger:#}");
+
+    for n in [laptop, desktop, other, vps] {
+        n.close().await;
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_socket_and_root_restart() {

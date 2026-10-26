@@ -32,6 +32,8 @@ pub(crate) struct Session {
     /// Kept open: dropping it would finish the watch stream.
     _send: SendStream,
     recv: RecvStream,
+    /// The state as of the last frame on the watch stream, which deltas apply to.
+    state: Snapshot,
 }
 
 impl Inner {
@@ -96,11 +98,12 @@ impl Inner {
         }
         let (mut send, mut recv) = conn.open_bi().await?;
         frame::write(&mut send, &Open::Watch).await?;
-        match frame::read::<_, Reply>(&mut recv).await? {
-            Reply::State(snap) => self.apply_snapshot(snap).await,
+        let state = match frame::read::<_, Reply>(&mut recv).await? {
+            Reply::State(snap) => snap,
             other => return Err(reply_err(other)),
-        }
-        Ok(Session { anchor, conn, _send: send, recv })
+        };
+        self.apply_snapshot(state.clone()).await;
+        Ok(Session { anchor, conn, _send: send, recv, state })
     }
 
     /// Gets or renews our certificate from the anchor on `conn`; returns the anchor's certificate.
@@ -189,17 +192,21 @@ impl Inner {
         }
     }
 
-    /// Applies pushed snapshots and renews the certificate until the session ends.
+    /// Applies pushed changes and renews the certificate until the session ends.
     async fn run_session(self: &Arc<Self>, s: Session) -> Result<()> {
-        let Session { anchor, conn, _send, mut recv } = s;
+        let Session { anchor, conn, _send, mut recv, mut state } = s;
         let me = self.clone();
         // Reads run in their own task: cancelling a read mid-frame would corrupt the stream.
         let mut reader = tokio::spawn(async move {
             loop {
                 match frame::read::<_, Reply>(&mut recv).await? {
-                    Reply::State(snap) => me.apply_snapshot(snap).await,
+                    Reply::State(snap) => state = snap,
+                    // Deltas apply to this stream's state, not ours: the anchor
+                    // may be behind what we learned elsewhere.
+                    Reply::Delta(delta) => delta.apply(&mut state).map_err(|e| anyhow!(e))?,
                     other => return Err(reply_err(other)),
                 }
+                me.apply_snapshot(state.clone()).await;
             }
         });
         let back_to_root = (anchor != self.root).then(|| Instant::now() + PREFER_ROOT_AFTER);

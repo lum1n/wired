@@ -14,6 +14,7 @@ Built on [iroh](https://iroh.computer), with all of n0's default infrastructure 
 Each [release](https://github.com/lum1n/wired/releases) has, for Linux x64/arm64 and macOS arm64:
 - `wired-<version>-<platform>.tar.gz`: the `wired` CLI.
 - `wired-node-<version>-<platform>.tar.gz`: the Node binding, ready to `require('./wired-node')`.
+- `wired-go-<version>-<platform>.tar.gz`: `libwired_ffi.a` for the Go binding (see [Other languages](#other-languages)).
 
 `SHA256SUMS` lists their hashes. Linux builds need glibc 2.35 or newer (Debian 12, Ubuntu 22.04). To build from source: `cargo build --release -p wired-cli`.
 
@@ -66,7 +67,7 @@ let stream = vps.dial("api@laptop").await?;
 
 Every binding wraps the same Rust core. On Unix, the Node and Go bindings get each stream as a socket descriptor, so you get native socket types. Swift gets async read/write instead.
 
-**Go** (`bindings/go`, cgo; run `scripts/build.sh` first). A `Listener` is a `net.Listener` and a `Conn` is a `net.Conn`.
+**Go** (`bindings/go`, cgo). A `Listener` is a `net.Listener` and a `Conn` is a `net.Conn`. The binding links the Rust core as a static library, which isn't in git. In a checkout, `scripts/build.sh` builds it, or `scripts/fetch.sh [version]` downloads it from a release, so no Rust is needed. In a module that depends on the binding, unpack `wired-go-<version>-<platform>.tar.gz` (or run `fetch.sh <version> <dir>`) and build with `CGO_LDFLAGS=-L<dir>`.
 
 ```go
 laptop, _ := wired.Join(wired.JoinOptions{Name: "laptop"})
@@ -114,7 +115,7 @@ wired join --name robin --relay-url https://robin.exe.xyz --relay-bind 127.0.0.1
 
 If your app already owns the HTTPS port, forward just those two paths. In Node: `relayProxy('127.0.0.1:8790')` gives `matches`, `request` and `upgrade` handlers for an `http.Server`.
 
-`wired status` shows whether a node is connected to its home relay, the relay others reach it through, and why not if it isn't.
+On an anchor, `wired status` shows whether it is connected to its home relay, the relay others reach it through, and why not if it isn't. It talks to the admin socket (see [Access control](#access-control)), so it doesn't work on members.
 
 The relay admits only this network's nodes (it checks a token derived from the network, and refuses revoked keys). It only ever sees ciphertext.
 
@@ -122,7 +123,7 @@ The relay admits only this network's nodes (it checks a token derived from the n
 
 - Restrict a service to named nodes with `--allow api=vps,desktop` on the CLI, or `listen_allow` / `expose_allow` in the library. Names are bound to keys by certificates and are unique in the network.
 - `wired members` lists the network's nodes.
-- `wired revoke <name>` removes a node now. Every node drops its connections to it within moments. The join secret rotates, so the command prints a new invite; existing members are unaffected, and the revoked node can't rejoin under any key.
+- `wired revoke <name>` removes a node now. Every node drops its connections to it within moments. The join secret rotates, so the command prints a new invite; existing members are unaffected (even one that was offline past its 24-hour certificate renews with its key, not the secret), and the revoked node can't rejoin under any key.
 - `wired rotate` replaces a leaked invite without revoking anyone.
 
 Admin commands talk to the running anchor through a local socket in its state directory, so only the user running the anchor can use them.
@@ -143,6 +144,15 @@ wired approve <vps2-id>
 - Invites issued after a replica joins list it, and members learn about it automatically.
 - If the root is down, the network keeps running: members renew at a replica and peers still verify each other. Only new joins, revocations and approvals wait for the root.
 - Back up the root's state directory (`~/.config/wired`). It holds the network's root key.
+
+### If the root's state directory is lost
+
+A replica can't be promoted to root. Replicas never hold the root key, and every invite, certificate and member pins that key, so there is nothing to hand over. Without the key, the network keeps running only as long as the replicas' anchor certificates last: 15 to 30 days after the root disappears. Members renew at replicas until then.
+
+- **From a backup.** Restore the directory and run `wired anchor` with the same `--name`. Only `<name>.key` is irreplaceable. It never changes, so one copy of it is enough. `anchor/state` holds the members, revocations, approvals and join secret, so a stale copy loses whatever changed after it was taken. Back it up again after each `revoke`, `rotate`, `approve` and new join. A stale copy is worse than it looks: members and replicas ignore a restored root's updates as older than the state they already hold, until the root has made as many changes as it missed. Until then, a revocation you redo there doesn't reach them.
+- **Without a backup.** Start a new network: run `wired anchor` with an empty state directory, which prints a new invite. Restart every member and replica with that invite, and approve the replicas again. Keys and names can stay the same. Each node ignores its cached state for the old network.
+
+Don't run `wired anchor` on an empty state directory if you meant to restore. It quietly creates a new network.
 
 ## Security model
 

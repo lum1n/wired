@@ -124,7 +124,7 @@ struct RelayArgs {
     #[arg(long, value_name = "URL", requires = "relay_bind")]
     relay_url: Option<String>,
     /// Local address the relay listens on, behind the proxy.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", requires = "relay_url")]
     relay_bind: Option<SocketAddr>,
 }
 
@@ -288,5 +288,22 @@ async fn main() -> Result<()> {
         Cmd::Approve { id, admin } => admin.run(&format!("approve {id}")).await,
         Cmd::Members { admin } => admin.run("members").await,
         Cmd::Status { admin } => admin.run("status").await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bindings refuse one without the other; silently dropping `--relay-bind` would leave a
+    /// member without its relay, or have an anchor serve a public one instead.
+    #[test]
+    fn relay_bind_needs_relay_url() {
+        for cmd in [&["wired", "join", "--name", "a", "--invite", "x"][..], &["wired", "anchor"]] {
+            let args = cmd.iter().chain(&["--relay-bind", "127.0.0.1:8790"]);
+            assert!(Cli::try_parse_from(args).is_err(), "{cmd:?} accepted --relay-bind without --relay-url");
+        }
+        let args = ["wired", "anchor", "--relay-url", "https://a.example", "--relay-bind", "127.0.0.1:8790"];
+        assert!(Cli::try_parse_from(args).is_ok());
     }
 }

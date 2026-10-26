@@ -60,7 +60,7 @@ Relay URLs are origins (`https://host[:port]`, or `http://` for testing) of at m
 
 All control messages are frames: a u32 big-endian length (at most 1 MiB) followed by the postcard encoding of the message. See `crates/wired-core/src/proto.rs`.
 
-Every QUIC bidirectional stream starts with one `Open` frame from the side that opened it. The accepting side answers with one `Reply` frame. For `Watch`, the reply is a sequence of frames.
+Every QUIC bidirectional stream starts with one `Open` frame from the side that opened it. The accepting side answers with one `Reply` frame. For `Watch`, the reply is a sequence of frames: one `State`, then `Delta`s.
 
 ## Certificates
 
@@ -117,8 +117,19 @@ sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secre
 
 - The root owns the snapshot. On every change it sets `version = max(version + 1, now in Unix milliseconds)` and signs it. Versions never go back, even when the root restarts from older saved state.
 - Other anchors pass the snapshot on unchanged. They can't alter it.
-- A node sends `Open::Watch` to an anchor. The anchor sends `Reply::State(snapshot)` immediately, and again on every change, for as long as the stream stays open.
-- `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`.
+- A node sends `Open::Watch` to an anchor. The anchor sends `Reply::State(snapshot)` immediately. After that, for as long as the stream stays open, it sends a `Reply::Delta` on every change:
+
+  ```
+  Delta { from, to, members_set: name → key, members_removed: {name},
+          denied_added: {key}, denied_removed: {key},
+          anchors: Option<[AnchorInfo]>, relays: Option<[RelayInfo]>, secret, sig }
+  ```
+
+  - `from` is the version of the previous frame on the stream and `to` the new version. Several changes may arrive as one delta.
+  - `members_set` holds the names that were added or whose key changed. `anchors` and `relays` are the full lists, sent only when they changed.
+  - `sig` is the root's signature on the snapshot at `to`.
+  - The watcher applies a delta to the state of the previous frame *on this stream*, which can be older than the state it holds. It then handles the result like a full snapshot, signature check included. A delta whose `from` doesn't match is a protocol error: the watcher drops the session and reconnects.
+- `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`. Each frame carries the current value.
 - A node takes a snapshot only if `sig` verifies under the root key and `version` is higher than the one it has. Anything else is ignored.
 - Each member and replica keeps one Watch session open:
   - It starts attempts at anchors root first, 2 seconds apart, and keeps the first that succeeds.
@@ -145,9 +156,9 @@ sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secre
 
 Revoking a node on the root does the following:
 1. Removes its name, adds its key to `denied`, removes it from `anchors` and any relays it owns, and rotates `S`.
-2. Publishes the new snapshot. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
+2. Publishes the change. Every watching node closes its connections to the key, and to peers whose certificate it issued, and refuses them from then on.
 
-Existing members keep working. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
+Existing members keep working. A registered key renews without a proof, so a member that was offline past its certificate rejoins with the old invite. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
 
 Limits:
 - A node that is cut off from every anchor learns of a revocation when it reconnects. Until then, the revoked node's certificate expires within 24 hours anyway.
@@ -158,6 +169,14 @@ Limits:
 1. A replica starts with the network's invite. It is not trusted until an operator approves its key on the root (`wired approve <id>`).
 2. The replica then sends `Join` with its `AnchorInfo` (and its `RelayInfo` if it serves one), receives an anchor certificate, and keeps a Watch session to replicate the snapshot.
 3. If the root is down, existing members renew at replicas, peers keep verifying each other's certificates (chains end at the root key), and names keep resolving. Only new joins, revocations and approvals wait for the root.
+
+### Losing the root
+
+A replica can't become the root. Only the root holds the root key, and invites, certificates and every node's trust all name it. With the root key gone, nothing can issue anchor certificates. Replicas renew at the root once less than half their lifetime is left, so their certificates run out 15 to 30 days after the root's last renewal. Member certificates they issued stop verifying at the same time.
+
+Recovery is one of these:
+- **Restore the root's state directory.** The key (`<name>.key`) never changes. `anchor/state` does, and nodes apply a snapshot only if its `version` is higher than theirs. A root restored from a stale copy has a lower `version` than the network, so its updates are ignored until it has made as many changes as it missed.
+- **Start a new network** with a new root key and `network_id`, and have every node join again with its invite. Nodes ignore cached state for another `network_id` or root.
 
 ## Errors
 
@@ -178,5 +197,5 @@ Limits:
 ## Administration
 
 A running anchor listens on a Unix socket at `<state_dir>/anchor/admin.sock`. The socket has mode 0600 and sits in a 0700 directory.
-- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>`, `members`, `relays`, `relay add <url>` or `relay remove <url>`.
+- **Request:** one line, one of `invite`, `rotate`, `revoke <name>`, `approve <id>`, `members`, `relays`, `relay add <url>`, `relay remove <url>` or `status` (the anchor's connection to its home relay).
 - **Response:** `ok` followed by the output, or `error: <message>`.
