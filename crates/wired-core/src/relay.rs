@@ -140,7 +140,7 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
                 None => crate::node::detect_host().await,
             };
             let info = RelayInfo {
-                url: format!("https://{}:{}", url_host(&host), https.port()),
+                url: origin(&format!("https://{}:{}", url_host(&host), https.port()))?,
                 pin: Some(*key.public().as_bytes()),
                 qad_port: server.quic_addr().map(|a| a.port()),
                 owner: Some(*key.public().as_bytes()),
@@ -148,20 +148,13 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
             (server, info, https)
         }
         RelayServe::BehindProxy { bind, url } => {
-            let parsed: url::Url = url.parse().with_context(|| format!("bad relay url {url}"))?;
-            ensure!(matches!(parsed.scheme(), "https" | "http"), "relay url must be https:// (or http:// for testing)");
-            ensure!(parsed.path() == "/" && parsed.query().is_none(), "relay url must be an origin, like https://host");
+            let url = origin(url)?;
             let mut relay = RelayConfig::new(*bind);
             relay.access = access;
             config.relay = Some(relay);
             let server = Server::spawn(config).await.context("start relay")?;
             let http = server.http_addr().context("relay has no http address")?;
-            let info = RelayInfo {
-                url: parsed.as_str().trim_end_matches('/').to_string(),
-                pin: None,
-                qad_port: None,
-                owner: Some(*key.public().as_bytes()),
-            };
+            let info = RelayInfo { url, pin: None, qad_port: None, owner: Some(*key.public().as_bytes()) };
             (server, info, http)
         }
     };
@@ -179,6 +172,30 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
 /// `[v6]` for IPv6 literals, as URLs and `host:port` need.
 pub(crate) fn url_host(host: &str) -> String {
     if host.contains(':') { format!("[{host}]") } else { host.to_string() }
+}
+
+/// Longest relay URL accepted. Listings travel in every snapshot and invite.
+pub(crate) const MAX_URL: usize = 256;
+
+/// Checks that `url` is a relay origin (`https://host[:port]`, or `http://` for
+/// testing) and returns its canonical form, without a trailing slash.
+pub(crate) fn origin(url: &str) -> Result<String> {
+    ensure!(url.len() <= MAX_URL, "relay url is longer than {MAX_URL} bytes");
+    let parsed: url::Url = url.parse().with_context(|| format!("bad relay url {url}"))?;
+    ensure!(matches!(parsed.scheme(), "https" | "http"), "relay url must be https:// (or http:// for testing)");
+    ensure!(
+        parsed.has_host()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "relay url must be an origin, like https://host"
+    );
+    let url = parsed.as_str().trim_end_matches('/').to_string();
+    ensure!(url.len() <= MAX_URL, "relay url is longer than {MAX_URL} bytes");
+    url.parse::<iroh::RelayUrl>().with_context(|| format!("bad relay url {url}"))?;
+    Ok(url)
 }
 
 /// Two relay URLs name the same relay (ignoring a trailing slash).
@@ -207,12 +224,13 @@ mod tests {
         let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
         let relay = start(&serve, &key, &[3; 16]).await.unwrap();
         let url: iroh::RelayUrl = format!("http://{}", relay.local_addr).parse().unwrap();
-        let mut client = iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
-            .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
-            .auth_token(token(&[3; 16]))
-            .connect()
-            .await
-            .unwrap();
+        let mut client =
+            iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
+                .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
+                .auth_token(token(&[3; 16]))
+                .connect()
+                .await
+                .unwrap();
         drop(relay);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(Ok(_)) = client.next().await {}

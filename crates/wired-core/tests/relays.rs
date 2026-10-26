@@ -312,3 +312,51 @@ async fn a_node_reaches_its_own_relay_when_its_public_address_does_not_loop_back
     assert!(status.iter().any(|r| r.connected && r.url == direct), "{status:?}");
     node.close().await;
 }
+
+/// A root that serves a public relay and takes direct connections on loopback.
+async fn relay_root() -> Node {
+    let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let serve = RelayServe::Public { bind: lo, qad_bind: None, public_host: Some("127.0.0.1".into()) };
+    let cfg = AnchorConfig { bind: lo, public_host: Some("127.0.0.1".into()), replica_of: None };
+    Node::builder("home").anchor(cfg).relay(serve).ephemeral().spawn().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_cannot_take_over_another_nodes_relay_listing() {
+    init_logs();
+    let home = relay_root().await;
+    let before = home.relays();
+    assert_eq!(before.len(), 1, "{before:?}");
+    // Mallory announces the root's relay URL as one it serves behind a proxy (no pin).
+    let serve = RelayServe::BehindProxy {
+        bind: SocketAddr::from(([127, 0, 0, 1], free_port().await)),
+        url: before[0].url.clone(),
+    };
+    let mallory = tokio::time::timeout(
+        Duration::from_secs(30),
+        Node::builder("mallory").invite(home.invite().parse().unwrap()).relay(serve).ephemeral().spawn(),
+    )
+    .await
+    .expect("join hung")
+    .unwrap();
+    assert_eq!(home.relays(), before);
+    home.revoke("mallory").unwrap();
+    assert_eq!(home.relays(), before);
+    mallory.close().await;
+    home.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_relay_in_an_invite_does_not_stop_a_node_from_starting() {
+    init_logs();
+    let home = relay_root().await;
+    let mut invite: Invite = home.invite().parse().unwrap();
+    invite.relays.push(wired_core::RelayInfo { url: "http//[bad".into(), pin: None, qad_port: None, owner: None });
+    let laptop =
+        tokio::time::timeout(Duration::from_secs(30), Node::builder("laptop").invite(invite).ephemeral().spawn())
+            .await
+            .expect("join hung")
+            .unwrap();
+    laptop.close().await;
+    home.close().await;
+}

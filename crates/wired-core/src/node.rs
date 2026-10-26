@@ -718,7 +718,11 @@ async fn bind_endpoint(
     let pins = relays.iter().filter_map(|r| r.pin.and_then(|p| PublicKey::from_bytes(&p).ok())).collect();
     let pinned: tls::Pinned = Arc::new(RwLock::new(pins));
     let token = relay::token(network_id);
-    let map: RelayMap = relays.iter().map(|r| relay_config(r, own, &token)).collect::<Result<_>>()?;
+    // A bad entry in a cached snapshot or an invite must not keep the node from starting.
+    let map: RelayMap = relays
+        .iter()
+        .filter_map(|r| relay_config(r, own, &token).inspect_err(|e| warn!(url = %r.url, "ignoring relay: {e:#}")).ok())
+        .collect();
     let lookup = MemoryLookup::new();
     let mut net_report = NetReportConfig::default();
     // Relays behind proxies serve only `/relay` and `/ping`; no `/generate_204`.

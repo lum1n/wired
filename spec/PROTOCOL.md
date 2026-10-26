@@ -28,6 +28,8 @@ The token keeps strangers off the relay's bandwidth; it is not what protects tra
 - The root adds it (`add_relay`). This is needed to bootstrap: a node can only join through a relay that the root is already connected to.
 - A node that serves one announces it in `Join`, and the root records it with that node as `owner`. Revoking the owner removes its relays.
 
+Relay URLs are origins (`https://host[:port]`, or `http://` for testing) of at most 256 bytes. A member lists at most one relay: a new announcement replaces its earlier one. It never replaces a listing another node owns. It may claim a listing the root added (owner `None`) when it announces no pin. A Public relay's `pin` must be the announcing node's key. Nodes skip any listed relay they cannot use, and still start.
+
 ## Roles
 
 - **Root anchor.** It creates the network. Its key is the trust anchor, and it is the only place where the network's state can change: new keys, revocations, anchor approvals and relays. It needs no inbound reachability: it can sit behind NAT and reach everyone through relays.
@@ -98,7 +100,7 @@ The anchor checks, in order:
    - **Registered key.** `name` must equal its registered name. No proof is needed: the TLS handshake proved possession of the key. Any anchor may renew it.
    - **New key.** It is accepted only at the root. `proof` must verify under the current `S`, compared in constant time, and `name` must be unclaimed. The root records the name and the key atomically.
 4. If `anchor` (an `AnchorInfo`) is present, the key must have been approved on the root. The root then records the key as an anchor and issues an anchor certificate.
-5. If `relay` (a `RelayInfo`) is present, the root lists that relay with the joining key as its owner.
+5. If `relay` (a `RelayInfo`) is present, it must be valid (see Listing) or the join is refused. The root lists that relay with the joining key as its owner.
 
 On success, the reply is `Reply::Joined { cert, anchor }`, where `anchor` is the answering anchor's own certificate. The joining node verifies both. Later `Join` streams on the same connection renew the certificate.
 

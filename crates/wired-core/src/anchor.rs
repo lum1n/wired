@@ -12,11 +12,12 @@ use crate::{
     node::{Inner, Node, valid_name},
     peer::Refusal,
     proto::{Cert, ErrorCode, JOIN_EXPORTER_LABEL, JOIN_MAC_CONTEXT, PROTOCOL_VERSION, Reply, Role, Snapshot},
-    relay::same_url,
+    relay::{self, same_url},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use iroh::{PublicKey, endpoint::Connection, endpoint::SendStream};
 use tokio::sync::watch;
+use tracing::warn;
 
 pub(crate) struct AnchorState {
     /// How to reach this anchor; published in the snapshot.
@@ -96,6 +97,10 @@ impl Inner {
         if anchor.as_ref().is_some_and(|a| a.id != rk) {
             return Err(Refusal(ErrorCode::Protocol, "anchor info is for another key".into()));
         }
+        let relay = relay
+            .map(|r| announced_relay(r, rk))
+            .transpose()
+            .map_err(|e| Refusal(ErrorCode::Protocol, format!("{e:#}")))?;
         let snap = self.snapshot();
         if snap.denied.contains(&rk) {
             return Err(Refusal(ErrorCode::Denied, "this key is revoked".into()));
@@ -156,7 +161,7 @@ impl Inner {
         // A member serving a relay: list it, owned by that member. Only the
         // root changes the network; elsewhere the member re-announces later.
         if root && let Some(r) = relay {
-            self.update_snapshot(|s| upsert_relay(s, RelayInfo { owner: Some(rk), ..r }));
+            self.update_snapshot(|s| list_member_relay(s, r));
         }
 
         let role = if root && self.snapshot().is_anchor(&rk) { Role::Anchor } else { Role::Member };
@@ -202,11 +207,29 @@ fn not_approved(key: PublicKey) -> Refusal {
     Refusal(ErrorCode::NotApproved, format!("run `wired approve {key}` on the root anchor"))
 }
 
-fn upsert_relay(s: &mut Snapshot, info: RelayInfo) -> bool {
+/// A relay a member announced in `Join`, checked and owned by `owner`.
+fn announced_relay(r: RelayInfo, owner: [u8; 32]) -> Result<RelayInfo> {
+    let url = relay::origin(&r.url)?;
+    // A public relay's certificate is made from its node's key, so that is the only pin it can have.
+    ensure!(r.pin.is_none_or(|p| p == owner), "a relay's pin must be the announcing node's key");
+    Ok(RelayInfo { url, pin: r.pin, qad_port: r.qad_port, owner: Some(owner) })
+}
+
+/// Lists a member's relay, replacing the one it listed before (one per member).
+/// A member never takes over a listing another node owns. It may claim one the
+/// root added for it (so it could join through it), as long as it adds no pin.
+fn list_member_relay(s: &mut Snapshot, info: RelayInfo) -> bool {
     if s.relays.contains(&info) {
         return false;
     }
-    s.relays.retain(|r| !same_url(&r.url, &info.url));
+    let claimable = |r: &RelayInfo| r.owner == info.owner || (r.owner.is_none() && info.pin.is_none());
+    if let Some(r) = s.relays.iter().find(|r| same_url(&r.url, &info.url))
+        && !claimable(r)
+    {
+        warn!(url = %info.url, "ignoring a relay announcement for a listing another node owns");
+        return false;
+    }
+    s.relays.retain(|r| r.owner != info.owner && !same_url(&r.url, &info.url));
     s.relays.push(info);
     true
 }
@@ -265,10 +288,7 @@ impl Node {
     /// against the usual CA roots.
     pub fn add_relay(&self, url: &str) -> Result<()> {
         self.require_root("add relays")?;
-        let parsed: url::Url = url.parse().with_context(|| format!("bad relay url {url}"))?;
-        ensure!(matches!(parsed.scheme(), "https" | "http"), "relay url must be https:// (or http:// for testing)");
-        ensure!(parsed.path() == "/" && parsed.query().is_none(), "relay url must be an origin, like https://host");
-        let url = parsed.as_str().trim_end_matches('/').to_string();
+        let url = relay::origin(url)?;
         self.inner.update_snapshot(|s| {
             // Keep an entry the relay's own node announced (it knows more).
             if s.relays.iter().any(|r| same_url(&r.url, &url)) {
@@ -302,5 +322,52 @@ impl Node {
         self.inner.anchor_state().approved.lock().unwrap().insert(*id.as_bytes());
         self.inner.persist();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay(url: &str, pin: Option<[u8; 32]>, owner: Option<[u8; 32]>) -> RelayInfo {
+        RelayInfo { url: url.into(), pin, qad_port: None, owner }
+    }
+
+    #[test]
+    fn announced_relays_must_be_bounded_origins_pinned_to_their_owner() {
+        let ok = announced_relay(relay("https://Robin.example.com:443/", None, None), [1; 32]).unwrap();
+        assert_eq!(ok, relay("https://robin.example.com", None, Some([1; 32])));
+        announced_relay(relay("https://vps.example.com:7443", Some([1; 32]), None), [1; 32]).unwrap();
+        let long = format!("https://{}.example.com", "z".repeat(250));
+        for bad in ["http//[bad", "not a url", "ftp://host", "https://host/path", "https://u:p@host", &long] {
+            assert!(announced_relay(relay(bad, None, None), [1; 32]).is_err(), "{bad}");
+        }
+        assert!(announced_relay(relay("https://vps.example.com", Some([2; 32]), None), [1; 32]).is_err());
+    }
+
+    #[test]
+    fn a_member_lists_one_relay_and_never_takes_over_another_nodes() {
+        let (root, alice, eve) = ([0; 32], [1; 32], [2; 32]);
+        let mut s = Snapshot {
+            relays: vec![
+                relay("https://root.example", Some(root), Some(root)),
+                relay("https://admin.example", None, None),
+            ],
+            ..Default::default()
+        };
+        assert!(list_member_relay(&mut s, relay("https://alice.example", Some(alice), Some(alice))));
+        // Another node's listing stays as it is, pinned or not.
+        assert!(!list_member_relay(&mut s, relay("https://root.example", None, Some(eve))));
+        assert!(!list_member_relay(&mut s, relay("https://alice.example", Some(eve), Some(eve))));
+        // A root-added listing can be claimed by its server, but not re-pinned.
+        assert!(!list_member_relay(&mut s, relay("https://admin.example", Some(eve), Some(eve))));
+        assert!(list_member_relay(&mut s, relay("https://admin.example", None, Some(eve))));
+        // A new announcement replaces the member's earlier one.
+        assert!(list_member_relay(&mut s, relay("https://eve2.example", None, Some(eve))));
+        assert!(!list_member_relay(&mut s, relay("https://eve2.example", None, Some(eve))));
+        let urls: Vec<&str> = s.relays.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, ["https://root.example", "https://alice.example", "https://eve2.example"]);
+        assert_eq!(s.relays[0].owner, Some(root));
+        assert_eq!(s.relays[1].owner, Some(alice));
     }
 }
