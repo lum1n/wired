@@ -1,8 +1,8 @@
-# Wired protocol, version 2
+# Wired protocol, version 3
 
 This document is normative for every Wired implementation and binding.
 
-`Join` and `Hello` carry the protocol version, 2. A node refuses any other version with `BadVersion`. Version 2 added the root's signature to snapshots, so every node in a network must run it. The ALPN, signature contexts and invite format still say `wired/1`; they did not change.
+`Join` and `Hello` carry the protocol version, 3. A node refuses any other version with `BadVersion`. Version 2 added the root's signature to snapshots; version 3 added the relay token to them, so every node in a network must run it. The ALPN, signature contexts and invite format still say `wired/1`; they did not change.
 
 ## Transport
 
@@ -20,9 +20,11 @@ A relay is listed as `RelayInfo { url, pin, qad_port, owner }`. There are two ki
 - **Public:** on a reachable host. HTTPS uses a self-signed certificate made from the serving node's key. `pin` is that key, and clients accept the certificate only if it carries it. QUIC address discovery runs on `qad_port`.
 - **Behind a proxy:** a TLS-terminating proxy (exe.dev, nginx, Caddy) forwards `/relay` (a WebSocket) and `/ping` at the root of `url` to the relay's plain-HTTP socket. `pin` is `None`, so clients check the certificate against the usual CA roots: Mozilla's, and the system's (which honor `SSL_CERT_FILE` and `SSL_CERT_DIR`). There is no address discovery.
 
-**Access.** Relays admit a client only when both hold:
-- it presents `Authorization: Bearer T`, where `T = hex(SHA-256("wired/1 relay-token" ‖ network_id)[..16])`;
-- its key is not denied.
+**Access.** Relays admit a client only when its key is not denied and either:
+- its key is in `members`, or is the root's or the relay's own; or
+- it presents `Authorization: Bearer hex(relay_token)`, so a node can join through the relay before the network knows its key.
+
+`relay_token = SHA-256("wired/1 relay-token" ‖ network_id ‖ S)[..16]`. The root puts the current one in the snapshot. Rotating `S` (as revoking does) rotates it, so an old invite no longer gets a fresh key onto the relays. A node presents the token of the `S` it knows: members get in by key, so it doesn't matter when that is stale. A relay whose node has no snapshot the root signed yet uses the token of the `S` in its invite.
 
 The token keeps strangers off the relay's bandwidth; it is not what protects traffic.
 
@@ -111,7 +113,8 @@ On success, the reply is `Reply::Joined { cert, anchor }`, where `anchor` is the
 ## Network state
 
 ```
-Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], relays: [RelayInfo], secret, sig }
+Snapshot { version, members: name → key, denied: {key}, anchors: [AnchorInfo], relays: [RelayInfo],
+           relay_token, secret, sig }
 sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secret = None, sig = []))
 ```
 
@@ -122,11 +125,12 @@ sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secre
   ```
   Delta { from, to, members_set: name → key, members_removed: {name},
           denied_added: {key}, denied_removed: {key},
-          anchors: Option<[AnchorInfo]>, relays: Option<[RelayInfo]>, secret, sig }
+          anchors: Option<[AnchorInfo]>, relays: Option<[RelayInfo]>, relay_token: Option<[u8; 16]>,
+          secret, sig }
   ```
 
   - `from` is the version of the previous frame on the stream and `to` the new version. Several changes may arrive as one delta.
-  - `members_set` holds the names that were added or whose key changed. `anchors` and `relays` are the full lists, sent only when they changed.
+  - `members_set` holds the names that were added or whose key changed. `anchors` and `relays` are the full lists, sent only when they changed, as is `relay_token`.
   - `sig` is the root's signature on the snapshot at `to`.
   - The watcher applies a delta to the state of the previous frame *on this stream*, which can be older than the state it holds. It then handles the result like a full snapshot, signature check included. A delta whose `from` doesn't match is a protocol error: the watcher drops the session and reconnects.
 - `secret` is sent only to anchors, so replicas can hand out current invites. Members receive `None`. Each frame carries the current value.
@@ -136,6 +140,7 @@ sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secre
   - When attached to a replica, it goes back to the root every 5 minutes.
   - It reconnects with backoff from 1 to 30 seconds.
 - Names resolve locally from `members`. There is no lookup request.
+- A node starting with an invite and saved state the root signed keeps that state unchanged. It also tries the invite's anchors and relays until it hears from an anchor.
 - A root that starts from saved state first asks the other anchors (`Watch`, waiting at most 5 seconds) for their snapshot. If one it signed is newer than its own, it continues from that one, so revocations made after a backup survive a restore.
 
 ## Peer connections
@@ -144,6 +149,7 @@ sig = Ed25519_sign(root_key, "wired/1 snapshot" ‖ postcard(snapshot with secre
 - Both sides also check that `members` maps the certificate's name to the peer's key, waiting up to 2 seconds for a node that just joined. Otherwise the acceptor refuses with `Unauthorized`. So an anchor can't certify a name for another key.
 - Both sides must reject any other stream on the connection until this exchange has finished.
 - The dialer must check that the peer's certificate carries the name it dialed.
+- A connection lasts only as long as the peer's certificate: each side closes it when that certificate, or its `issuer_cert`, expires. To keep the connection, a node that renews its certificate sends `Hello` with the new one on every open connection. The reply carries the other side's current certificate, which replaces the one it showed before. A `Join` that renews on the connection counts as showing the certificate it gets back.
 
 ## Services
 
@@ -161,7 +167,7 @@ Revoking a node on the root does the following:
 Existing members keep working. A registered key renews without a proof, so a member that was offline past its certificate rejoins with the old invite. The old invite can no longer add nodes, and the revoked node can't rejoin under any key.
 
 Limits:
-- A node that is cut off from every anchor learns of a revocation when it reconnects. Until then, the revoked node's certificate expires within 24 hours anyway.
+- A node that is cut off from every anchor learns of a revocation when it reconnects. Until then, the revoked node's certificate expires within 24 hours anyway, and its connections close then.
 - A member attached to a revoked replica learns of the revocation within 5 minutes, when it moves back to the root.
 
 ## Replicas

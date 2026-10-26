@@ -41,12 +41,25 @@ pub fn issue(
         Role::Member => MEMBER_LIFETIME,
         Role::Anchor => ANCHOR_LIFETIME,
     };
+    issue_until(issuer, issuer_cert, network_id, node, name, role, now_unix() + lifetime.as_secs())
+}
+
+/// [`issue`], expiring at `expires` (Unix seconds).
+pub(crate) fn issue_until(
+    issuer: &SecretKey,
+    issuer_cert: Option<&Cert>,
+    network_id: [u8; 16],
+    node: PublicKey,
+    name: &str,
+    role: Role,
+    expires: u64,
+) -> Cert {
     let body = CertBody {
         network_id,
         node_id: *node.as_bytes(),
         name: name.to_string(),
         role,
-        expires: now_unix() + lifetime.as_secs(),
+        expires,
         issuer: *issuer.public().as_bytes(),
     };
     let sig = issuer.sign(&signed_bytes(&body)).to_bytes().to_vec();
@@ -107,6 +120,11 @@ pub fn remaining(cert: &Cert) -> u64 {
     cert.body.expires.saturating_sub(now_unix())
 }
 
+/// When `cert` stops verifying by age: when it or its issuer's certificate expires.
+pub fn valid_until(cert: &Cert) -> u64 {
+    cert.issuer_cert.as_ref().map_or(cert.body.expires, |ic| cert.body.expires.min(ic.body.expires))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +178,13 @@ mod tests {
         let self_signed = issue(&replica, None, NET, replica.public(), "vps2", Role::Anchor);
         let forged = issue(&replica, Some(&self_signed), NET, node, "laptop", Role::Member);
         assert!(verify(&forged, &trust(&root, &none), node).is_err());
+
+        // It is good only as long as the issuer's certificate is.
+        let mut short_lived = anchor_cert.clone();
+        short_lived.body.expires = cert.body.expires - 10;
+        let chained = issue(&replica, Some(&short_lived), NET, node, "laptop", Role::Member);
+        assert_eq!(valid_until(&chained), cert.body.expires - 10);
+        assert_eq!(valid_until(&anchor_cert), anchor_cert.body.expires);
 
         // Without the chain, a replica-issued certificate does not verify.
         let mut bare = cert.clone();

@@ -1,6 +1,12 @@
 //! Connections between nodes: authentication, the connection pool, services.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use iroh::{
@@ -17,6 +23,9 @@ use crate::{
 };
 
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest wait between checks that a peer's certificate is still good. A timer doesn't
+/// count time the machine sleeps, so a long one could fire well after the expiry.
+const EXPIRY_CHECK: Duration = Duration::from_secs(60);
 /// How long a dial waits for an unknown name to show up in the network state.
 const NAME_WAIT: Duration = Duration::from_secs(2);
 
@@ -86,11 +95,44 @@ impl Inner {
         }
     }
 
-    pub(crate) fn add_peer(self: &Arc<Self>, conn: Connection, name: String, issuer: [u8; 32]) {
-        let id = conn.remote_id();
-        self.peers.lock().unwrap().insert(id, Peer { conn: conn.clone(), name: name.clone(), issuer });
+    /// Adds an authenticated connection, from the certificate the peer showed on it.
+    pub(crate) fn add_peer(self: &Arc<Self>, conn: Connection, cert: &Cert) -> Peer {
+        let peer = Peer {
+            conn: conn.clone(),
+            name: cert.body.name.clone(),
+            issuer: cert.body.issuer,
+            expires: Arc::new(AtomicU64::new(cert::valid_until(cert))),
+        };
+        self.peers.lock().unwrap().insert(conn.remote_id(), peer.clone());
         // Ends by itself when the connection closes, so it is not tracked in `tasks`.
-        tokio::spawn(self.clone().serve_streams(conn, name));
+        tokio::spawn(self.clone().serve_streams(peer.clone()));
+        peer
+    }
+
+    /// Shows our certificate, just renewed, to every peer, so connections outlive the one they
+    /// saw. Each answers with its own current certificate.
+    pub(crate) fn announce_cert(&self) {
+        let Some(me) = self.me.upgrade() else { return };
+        let peers: Vec<Peer> = self.peers.lock().unwrap().values().cloned().collect();
+        for peer in peers {
+            let me = me.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = me.rehello(&peer).await {
+                    debug!(peer = %peer.name, "showing a renewed certificate failed: {e:#}");
+                }
+            });
+        }
+    }
+
+    async fn rehello(&self, peer: &Peer) -> Result<()> {
+        let open = Open::Hello { version: PROTOCOL_VERSION, cert: self.own_cert()? };
+        let (_, _, reply) = request(&peer.conn, &open).await?;
+        let Reply::Hello { cert: theirs } = reply else { return Err(reply_err(reply)) };
+        cert::verify(&theirs, &self.trust(&self.snapshot()), peer.conn.remote_id())
+            .context("peer presented a bad certificate")?;
+        ensure!(theirs.body.name == peer.name, "{} answered as {:?}", peer.name, theirs.body.name);
+        peer.expires.store(cert::valid_until(&theirs), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Closes connections to revoked keys and to peers certified by revoked anchors.
@@ -178,9 +220,7 @@ impl Inner {
             "{:?} is not registered to that key",
             theirs.body.name
         );
-        let peer = Peer { conn: conn.clone(), name: theirs.body.name.clone(), issuer: theirs.body.issuer };
-        self.add_peer(conn, peer.name.clone(), peer.issuer);
-        Ok(peer)
+        Ok(self.add_peer(conn, &theirs))
     }
 
     // --- accepting -----------------------------------------------------------
@@ -206,7 +246,7 @@ impl Inner {
                 .context("no hello")??;
         let (reply, peer) = match open {
             Open::Join { .. } | Open::Hello { .. } => match self.authenticate(&conn, open).await {
-                Ok((reply, name, issuer)) => (reply, Some((name, issuer))),
+                Ok((reply, cert)) => (reply, Some(cert)),
                 Err(r) => (r.into(), None),
             },
             _ => (err(ErrorCode::Unauthorized, "authenticate first"), None),
@@ -214,8 +254,8 @@ impl Inner {
         frame::write(&mut send, &reply).await?;
         let _ = send.finish();
         match peer {
-            Some((name, issuer)) => {
-                self.add_peer(conn, name, issuer);
+            Some(cert) => {
+                self.add_peer(conn, &cert);
                 Ok(())
             }
             None => {
@@ -227,14 +267,15 @@ impl Inner {
         }
     }
 
-    /// Handles `Join` or `Hello`; returns the reply, the peer's name and its issuer.
-    async fn authenticate(&self, conn: &Connection, open: Open) -> Result<(Reply, String, [u8; 32]), Refusal> {
+    /// Handles `Join` or `Hello`; returns the reply and the peer's certificate (the one it
+    /// showed, or the one it was just issued).
+    async fn authenticate(&self, conn: &Connection, open: Open) -> Result<(Reply, Cert), Refusal> {
         let own =
             || self.own_cert().map_err(|_| Refusal(ErrorCode::NotApproved, "this anchor is not ready yet".into()));
         match open {
             Open::Join { version, network_id, name, proof, anchor, relay } if self.anchor.is_some() => {
                 let cert = self.admit(conn, version, network_id, &name, proof, anchor, relay)?;
-                Ok((Reply::Joined { cert, anchor: own()? }, name, *self.ep.id().as_bytes()))
+                Ok((Reply::Joined { cert: cert.clone(), anchor: own()? }, cert))
             }
             Open::Join { .. } => Err(Refusal(ErrorCode::Protocol, "not an anchor".into())),
             Open::Hello { version, cert } => {
@@ -249,21 +290,37 @@ impl Inner {
                     let msg = format!("{:?} is not registered to this key", cert.body.name);
                     return Err(Refusal(ErrorCode::Unauthorized, msg));
                 }
-                Ok((Reply::Hello { cert: own()? }, cert.body.name, cert.body.issuer))
+                Ok((Reply::Hello { cert: own()? }, cert))
             }
             _ => Err(Refusal(ErrorCode::Protocol, "expected Join or Hello".into())),
         }
     }
 
-    /// Serves streams the peer opens on an authenticated connection.
-    async fn serve_streams(self: Arc<Self>, conn: Connection, peer_name: String) {
+    /// Serves streams the peer opens on an authenticated connection, until it closes or the
+    /// peer's certificate expires.
+    async fn serve_streams(self: Arc<Self>, peer: Peer) {
+        let Peer { conn, name: peer_name, expires, .. } = peer;
         let remote = conn.remote_id();
-        while let Ok((send, recv)) = conn.accept_bi().await {
+        let expired = expiry(expires.clone());
+        tokio::pin!(expired);
+        loop {
+            let (send, recv) = tokio::select! {
+                accepted = conn.accept_bi() => match accepted {
+                    Ok(s) => s,
+                    Err(_) => break,
+                },
+                () = &mut expired => {
+                    debug!(peer = %peer_name, "closing connection: its certificate expired");
+                    conn.close(3u32.into(), b"certificate expired");
+                    break;
+                }
+            };
             let me = self.clone();
             let conn = conn.clone();
+            let expires = expires.clone();
             let peer = PeerInfo { name: peer_name.clone(), id: remote };
             tokio::spawn(async move {
-                if let Err(e) = me.handle_stream(&conn, send, recv, peer).await {
+                if let Err(e) = me.handle_stream(&conn, send, recv, peer, &expires).await {
                     debug!("stream failed: {e:#}");
                 }
             });
@@ -280,6 +337,7 @@ impl Inner {
         mut send: SendStream,
         mut recv: RecvStream,
         peer: PeerInfo,
+        expires: &AtomicU64,
     ) -> Result<()> {
         // The peer may have been revoked since it authenticated.
         if self.snapshot().denied.contains(peer.id.as_bytes()) {
@@ -306,8 +364,14 @@ impl Inner {
                 }
             }
             Open::Watch if self.anchor.is_some() => return self.serve_watch(send, peer.id).await,
+            // A renewal, or a renewed certificate shown: the connection lives on with it.
             open @ (Open::Join { .. } | Open::Hello { .. }) => match self.authenticate(conn, open).await {
-                Ok((reply, _, _)) => reply,
+                Ok((reply, cert)) => {
+                    if cert.body.name == peer.name {
+                        expires.store(cert::valid_until(&cert), Ordering::Relaxed);
+                    }
+                    reply
+                }
                 Err(r) => r.into(),
             },
             Open::Watch => err(ErrorCode::Protocol, "not an anchor"),
@@ -315,6 +379,17 @@ impl Inner {
         frame::write(&mut send, &reply).await?;
         let _ = send.finish();
         Ok(())
+    }
+}
+
+/// Resolves once the time in `expires` (Unix seconds, which a renewal may move on) has passed.
+async fn expiry(expires: Arc<AtomicU64>) {
+    loop {
+        let left = expires.load(Ordering::Relaxed).saturating_sub(cert::now_unix());
+        if left == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(left).min(EXPIRY_CHECK)).await;
     }
 }
 
@@ -366,6 +441,77 @@ mod tests {
         let alice_key = alice.inner.ep.secret_key().clone();
         alice.close().await;
         assert!(matches!(hello(&root, &alice_key, real).await, Reply::Hello { .. }));
+        root.close().await;
+    }
+
+    /// A connection lasts as long as the certificate last shown on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_closes_when_the_peers_certificate_expires_unless_renewed() {
+        let root = root().await;
+        let alice = Node::builder("alice").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let alice_key = alice.inner.ep.secret_key().clone();
+        alice.close().await;
+        let (issuer, net) = (root.inner.ep.secret_key(), root.inner.network_id);
+        let expiring_in = |secs| {
+            cert::issue_until(issuer, None, net, alice_key.public(), "alice", Role::Member, cert::now_unix() + secs)
+        };
+
+        let ep = Endpoint::builder(presets::Minimal)
+            .secret_key(alice_key.clone())
+            .alpns(vec![crate::proto::ALPN.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(root.id()).with_ip_addr(root.inner.ep.bound_sockets()[0]);
+        let conn = ep.connect(addr, crate::proto::ALPN).await.unwrap();
+        let hello = |secs| Open::Hello { version: PROTOCOL_VERSION, cert: expiring_in(secs) };
+        let started = tokio::time::Instant::now();
+        let (_, _, reply) = request(&conn, &hello(3)).await.unwrap();
+        assert!(matches!(reply, Reply::Hello { .. }), "{reply:?}");
+
+        // Showing a renewed certificate keeps the connection past the first one's expiry...
+        let (_, _, reply) = request(&conn, &hello(8)).await.unwrap();
+        assert!(matches!(reply, Reply::Hello { .. }), "{reply:?}");
+        tokio::time::sleep_until(started + Duration::from_secs(5)).await;
+        assert!(conn.close_reason().is_none(), "closed while the renewed certificate was good");
+
+        // ...until that one expires too.
+        tokio::time::timeout(Duration::from_secs(10), conn.closed()).await.expect("still open after expiry");
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        ep.close().await;
+        root.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewed_certificate_reaches_connected_peers() {
+        let root = root().await;
+        let laptop = Node::builder("laptop").invite(root.invite().parse().unwrap()).ephemeral().spawn().await.unwrap();
+        let expires = cert::now_unix() + 1000;
+        let renewed = cert::issue_until(
+            root.inner.ep.secret_key(),
+            None,
+            root.inner.network_id,
+            laptop.id(),
+            "laptop",
+            Role::Member,
+            expires,
+        );
+        *laptop.inner.cert.write().unwrap() = Some(renewed);
+        laptop.inner.announce_cert();
+        let mut seen = false;
+        for _ in 0..100 {
+            let peer = root.inner.live_peer(laptop.id()).expect("the root is connected to the laptop");
+            if peer.expires.load(Ordering::Relaxed) == expires {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(seen, "the root still holds the laptop's old certificate");
+        laptop.close().await;
         root.close().await;
     }
 

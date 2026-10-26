@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wired_core::{AnchorConfig, ErrorCode, Invite, Node, RelayServe, RemoteError, SecretKey};
+use wired_core::{AnchorConfig, AnchorInfo, ErrorCode, Invite, Node, RelayInfo, RelayServe, RemoteError, SecretKey};
 
 fn init_logs() {
     let _ = tracing_subscriber::fmt()
@@ -349,6 +349,40 @@ async fn a_replica_restarts_from_saved_state_without_the_invite() {
     let vps2 = spawn_replica(None).await.unwrap();
     assert_eq!(vps2.id(), id);
     assert!(!vps2.is_root());
+    let laptop = member("laptop", &vps.invite()).await.unwrap();
+    assert!(eventually(20, || vps2.members().iter().any(|m| m.name == "laptop")).await, "the replica isn't syncing");
+    for n in [laptop, vps2, vps] {
+        n.close().await;
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A replica started with an invite again, one listing an anchor and a relay the network no
+/// longer has, keeps its saved state as the root signed it: the invite only helps it find the
+/// network, and what it saves and serves still verifies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_restarted_with_an_invite_keeps_only_what_the_root_signed() {
+    init_logs();
+    let vps = root("vps").await;
+    let dir = temp_dir("replica-invite");
+    let spawn_replica =
+        |invite: Invite| Node::builder("vps2").anchor(local_anchor(Some(invite))).state_dir(&dir).spawn();
+    let vps2 = spawn_replica(vps.invite().parse().unwrap()).await.unwrap();
+    vps.approve_anchor(vps2.id()).unwrap();
+    assert!(eventually(20, || vps.members().iter().any(|m| m.name == "vps2" && m.anchor)).await);
+    vps2.close().await;
+
+    let mut stale: Invite = vps.invite().parse().unwrap();
+    let gone = RelayInfo { url: "http://127.0.0.1:9".into(), pin: None, qad_port: None, owner: None };
+    stale.relays.push(gone.clone());
+    stale.anchors.push(AnchorInfo { id: *SecretKey::generate().public().as_bytes(), addrs: vec![] });
+    let vps2 = spawn_replica(stale).await.unwrap();
+    let saved = wired_core::state::load_anchor(&dir).unwrap().unwrap().snapshot;
+    saved.verify(&vps.id()).expect("the replica saved a snapshot the root didn't sign");
+    assert!(!saved.relays.contains(&gone));
+    assert!(eventually(20, || !vps2.relays().contains(&gone)).await, "the replica still lists the invite's relay");
+
+    // And it keeps syncing.
     let laptop = member("laptop", &vps.invite()).await.unwrap();
     assert!(eventually(20, || vps2.members().iter().any(|m| m.name == "laptop")).await, "the replica isn't syncing");
     for n in [laptop, vps2, vps] {

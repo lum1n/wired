@@ -7,7 +7,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use wired_core::{AnchorConfig, Invite, Node, PathKind, RelayServe};
+use wired_core::{AnchorConfig, Invite, Node, PathKind, RelayServe, relay};
 
 fn init_logs() {
     let _ = tracing_subscriber::fmt()
@@ -172,8 +172,11 @@ async fn relays_admit_only_the_network_and_not_revoked_keys() {
 
     let (url, _) = robin.served_relay().unwrap();
     let url: iroh::RelayUrl = url.parse().unwrap();
-    let invite: Invite = home.invite().parse().unwrap();
-    let token = wired_core::relay::token(&invite.network_id);
+    let token_of = |invite: &str| {
+        let invite: Invite = invite.parse().unwrap();
+        relay::bearer(&relay::token(&invite.network_id, &invite.secret))
+    };
+    let token = token_of(&home.invite());
     let connect = |key: wired_core::SecretKey, token: Option<String>| {
         let url = url.clone();
         async move {
@@ -186,23 +189,32 @@ async fn relays_admit_only_the_network_and_not_revoked_keys() {
             b.connect().await.map(|_| ())
         }
     };
+    /// Whether `connect` gets in within a few seconds: robin learns of changes a moment after the root makes them.
+    async fn becomes<F: Future<Output = Result<(), E>>, E>(admitted: bool, mut connect: impl FnMut() -> F) -> bool {
+        for _ in 0..100 {
+            if connect().await.is_ok() == admitted {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
 
-    // Strangers without the network's token are refused; members get in.
+    // Strangers without the network's token are refused; new keys with it, and members, get in.
     assert!(connect(wired_core::SecretKey::generate(), None).await.is_err());
     assert!(connect(wired_core::SecretKey::generate(), Some("nope".into())).await.is_err());
-    connect(laptop_key.clone(), Some(token.clone())).await.unwrap();
+    connect(wired_core::SecretKey::generate(), Some(token.clone())).await.unwrap();
+    assert!(becomes(true, || connect(laptop_key.clone(), None)).await, "a member is refused without a token");
 
-    // A revoked key is refused even with the token.
-    home.revoke("laptop").unwrap();
-    let mut refused = false;
-    for _ in 0..100 {
-        if connect(laptop_key.clone(), Some(token.clone())).await.is_err() {
-            refused = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(refused, "revoked key still admitted by the relay");
+    // A revoked key is refused even with the token. And as revoking rotates the token, the old
+    // invite no longer gets a fresh key in either; the new one does.
+    let new_invite = home.revoke("laptop").unwrap();
+    assert!(becomes(false, || connect(laptop_key.clone(), Some(token.clone()))).await, "revoked key admitted");
+    assert!(
+        becomes(false, || connect(wired_core::SecretKey::generate(), Some(token.clone()))).await,
+        "the token from before the revoke still admits new keys"
+    );
+    connect(wired_core::SecretKey::generate(), Some(token_of(&new_invite))).await.unwrap();
 
     for n in [laptop, robin, home] {
         n.close().await;

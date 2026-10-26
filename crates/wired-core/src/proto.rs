@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::invite::{AnchorInfo, NetworkSecret, RelayInfo};
 
 pub const ALPN: &[u8] = b"wired/1";
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Label for the TLS exporter that binds a join proof to its QUIC session.
 pub const JOIN_EXPORTER_LABEL: &[u8] = b"wired/1 join";
@@ -71,6 +71,9 @@ pub struct Snapshot {
     pub anchors: Vec<AnchorInfo>,
     /// Every relay. Nodes connect to all of them as needed.
     pub relays: Vec<RelayInfo>,
+    /// What a node the network doesn't know yet presents to relays, so it can join through
+    /// them: derived from the join secret (see [`crate::relay::token`]), so it changes with it.
+    pub relay_token: [u8; 16],
     /// Current join secret; only sent to anchors. Not covered by `sig`.
     pub secret: Option<NetworkSecret>,
     /// The root's Ed25519 signature over `SNAPSHOT_SIG_CONTEXT ‖ postcard(snapshot)`,
@@ -122,6 +125,8 @@ pub struct Delta {
     /// The full list, when it changed. These lists are short.
     pub anchors: Option<Vec<AnchorInfo>>,
     pub relays: Option<Vec<RelayInfo>>,
+    /// The new relay token, when it changed.
+    pub relay_token: Option<[u8; 16]>,
     /// Current join secret; only sent to anchors, as in [`Snapshot`].
     pub secret: Option<NetworkSecret>,
     /// The root's signature on the snapshot at `to`, so the watcher can check what it builds.
@@ -143,6 +148,7 @@ impl Delta {
             denied_removed: old.denied.difference(&new.denied).copied().collect(),
             anchors: (old.anchors != new.anchors).then(|| new.anchors.clone()),
             relays: (old.relays != new.relays).then(|| new.relays.clone()),
+            relay_token: (old.relay_token != new.relay_token).then_some(new.relay_token),
             secret: None,
             sig: new.sig.clone(),
         }
@@ -168,6 +174,9 @@ impl Delta {
         }
         if let Some(r) = self.relays {
             snap.relays = r;
+        }
+        if let Some(t) = self.relay_token {
+            snap.relay_token = t;
         }
         snap.secret = self.secret;
         snap.sig = self.sig;
@@ -241,6 +250,7 @@ mod tests {
             denied: denied.iter().map(|k| [*k; 32]).collect(),
             anchors: anchors.iter().map(|k| AnchorInfo { id: [*k; 32], addrs: vec![] }).collect(),
             relays: vec![],
+            relay_token: [0; 16],
             secret: None,
             sig: Vec::new(),
         }
@@ -318,6 +328,19 @@ mod tests {
         let mut got = old.clone();
         delta.apply(&mut got).unwrap();
         assert_eq!(got, new);
+    }
+
+    #[test]
+    fn delta_carries_a_changed_relay_token() {
+        let old = snap(1, &[], &[], &[]);
+        let new = Snapshot { version: 2, relay_token: [9; 16], ..old.clone() };
+        let delta = Delta::between(&old, &new);
+        assert_eq!(delta.relay_token, Some([9; 16]));
+        let mut got = old.clone();
+        delta.apply(&mut got).unwrap();
+        assert_eq!(got, new);
+        let next = Snapshot { version: 3, ..new.clone() };
+        assert_eq!(Delta::between(&new, &next).relay_token, None, "an unchanged token is not sent");
     }
 
     /// The secret is the delta's, not the base's: a node no longer an anchor stops holding one.

@@ -16,8 +16,11 @@ use crate::{
     proto::{Cert, Snapshot},
 };
 
-/// Starts every node state file since snapshots are signed. Older files have no header.
-const FORMAT: &[u8] = b"wired-state/2\n";
+/// Starts every node state file since snapshots carry the relay token.
+const FORMAT: &[u8] = b"wired-state/3\n";
+/// Started node state files from when snapshots were signed until they carried the relay
+/// token. Older files have no header.
+const FORMAT_V2: &[u8] = b"wired-state/2\n";
 
 /// `$XDG_CONFIG_HOME/wired`, falling back to `~/.config/wired`.
 pub fn default_dir() -> PathBuf {
@@ -66,17 +69,25 @@ pub fn load_or_create_key(dir: &Path, name: &str) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&b))
 }
 
-/// Reads a node state file, converting one in the format before snapshots were signed.
-/// `None` if it does not exist.
-fn load_state<T: DeserializeOwned, Old: DeserializeOwned + Into<T>>(path: &Path) -> Result<Option<T>> {
+/// Reads a node state file, converting one in an older format: `V2` from before snapshots
+/// carried the relay token, `V1` from before they were signed. `None` if it does not exist.
+fn load_state<T, V2, V1>(path: &Path) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+    V2: DeserializeOwned + Into<T>,
+    V1: DeserializeOwned + Into<T>,
+{
     let b = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let parsed = match b.strip_prefix(FORMAT) {
-        Some(rest) => postcard::from_bytes(rest),
-        None => postcard::from_bytes::<Old>(&b).map(Into::into),
+    let parsed = if let Some(rest) = b.strip_prefix(FORMAT) {
+        postcard::from_bytes(rest)
+    } else if let Some(rest) = b.strip_prefix(FORMAT_V2) {
+        postcard::from_bytes::<V2>(rest).map(Into::into)
+    } else {
+        postcard::from_bytes::<V1>(&b).map(Into::into)
     };
     Ok(Some(parsed.with_context(|| format!("parse {}", path.display()))?))
 }
@@ -88,7 +99,7 @@ fn save_state<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn load_anchor(dir: &Path) -> Result<Option<AnchorDisk>> {
-    load_state::<AnchorDisk, OldAnchorDisk>(&anchor_path(dir))
+    load_state::<AnchorDisk, AnchorDiskV2, OldAnchorDisk>(&anchor_path(dir))
 }
 
 pub fn save_anchor(dir: &Path, disk: &AnchorDisk) -> Result<()> {
@@ -96,7 +107,7 @@ pub fn save_anchor(dir: &Path, disk: &AnchorDisk) -> Result<()> {
 }
 
 pub fn load_member(dir: &Path, name: &str) -> Result<Option<MemberDisk>> {
-    load_state::<MemberDisk, OldMemberDisk>(&member_path(dir, name))
+    load_state::<MemberDisk, MemberDiskV2, OldMemberDisk>(&member_path(dir, name))
 }
 
 pub fn save_member(dir: &Path, name: &str, disk: &MemberDisk) -> Result<()> {
@@ -152,6 +163,62 @@ pub struct MemberDisk {
     pub snapshot: Snapshot,
 }
 
+// The format before snapshots carried the relay token. Its signatures no longer check
+// out, so its snapshots load unsigned, as in the format before them.
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct SnapshotV2 {
+    version: u64,
+    members: BTreeMap<String, [u8; 32]>,
+    denied: BTreeSet<[u8; 32]>,
+    anchors: Vec<AnchorInfo>,
+    relays: Vec<RelayInfo>,
+    secret: Option<NetworkSecret>,
+    _sig: Vec<u8>,
+}
+
+impl From<SnapshotV2> for Snapshot {
+    fn from(o: SnapshotV2) -> Self {
+        let SnapshotV2 { version, members, denied, anchors, relays, secret, _sig } = o;
+        Snapshot { version, members, denied, anchors, relays, relay_token: [0; 16], secret, sig: Vec::new() }
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct AnchorDiskV2 {
+    network_id: [u8; 16],
+    root: [u8; 32],
+    secret: NetworkSecret,
+    snapshot: SnapshotV2,
+    approved: BTreeSet<[u8; 32]>,
+    cert: Option<Cert>,
+}
+
+impl From<AnchorDiskV2> for AnchorDisk {
+    fn from(o: AnchorDiskV2) -> Self {
+        let AnchorDiskV2 { network_id, root, secret, snapshot, approved, cert } = o;
+        AnchorDisk { network_id, root, secret, snapshot: snapshot.into(), approved, cert }
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct MemberDiskV2 {
+    network_id: [u8; 16],
+    root: [u8; 32],
+    cert: Cert,
+    snapshot: SnapshotV2,
+}
+
+impl From<MemberDiskV2> for MemberDisk {
+    fn from(o: MemberDiskV2) -> Self {
+        let MemberDiskV2 { network_id, root, cert, snapshot } = o;
+        MemberDisk { network_id, root, cert, snapshot: snapshot.into() }
+    }
+}
+
 // The format before snapshots were signed. Its snapshots load unsigned.
 
 #[derive(Deserialize)]
@@ -168,7 +235,7 @@ struct OldSnapshot {
 impl From<OldSnapshot> for Snapshot {
     fn from(o: OldSnapshot) -> Self {
         let OldSnapshot { version, members, denied, anchors, relays, secret } = o;
-        Snapshot { version, members, denied, anchors, relays, secret, sig: Vec::new() }
+        Snapshot { version, members, denied, anchors, relays, relay_token: [0; 16], secret, sig: Vec::new() }
     }
 }
 
@@ -251,6 +318,34 @@ mod tests {
         save_member(&dir, "laptop", &disk).unwrap();
         assert!(fs::read(member_path(&dir, "laptop")).unwrap().starts_with(FORMAT));
         assert_eq!(load_member(&dir, "laptop").unwrap().unwrap().snapshot, disk.snapshot);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn state_saved_before_snapshots_carried_the_relay_token_loads_unsigned() {
+        let dir = std::env::temp_dir().join(format!("wired-state-{}", rand::random::<u64>()));
+        let key = SecretKey::generate();
+        let cert = crate::cert::issue(&key, None, [1; 16], key.public(), "laptop", crate::proto::Role::Member);
+        let old = MemberDiskV2 {
+            network_id: [1; 16],
+            root: *key.public().as_bytes(),
+            cert: cert.clone(),
+            snapshot: SnapshotV2 {
+                version: 9,
+                members: [("laptop".to_string(), *key.public().as_bytes())].into(),
+                denied: [[2; 32]].into(),
+                anchors: Vec::new(),
+                relays: Vec::new(),
+                secret: None,
+                _sig: vec![7; 64],
+            },
+        };
+        let mut data = FORMAT_V2.to_vec();
+        data.extend(postcard::to_stdvec(&old).unwrap());
+        write_private(&member_path(&dir, "laptop"), &data).unwrap();
+        let disk = load_member(&dir, "laptop").unwrap().unwrap();
+        assert_eq!((&disk.cert, disk.snapshot.version, disk.snapshot.sig.len()), (&cert, 9, 0));
+        assert!(disk.snapshot.denied.contains(&[2; 32]));
         fs::remove_dir_all(dir).ok();
     }
 }
