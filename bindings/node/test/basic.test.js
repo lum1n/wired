@@ -112,6 +112,11 @@ test('allowlist, admin calls and revoke', T, async (t) => {
   const fresh = vps.revoke('a')
   assert.match(fresh, /^wired1/)
   assert.ok(!vps.members().some((m) => m.name === 'a'))
+  // The revocation reaches b within moments; from then on, a is refused.
+  for (const deadline = Date.now() + 5000; b.members().some((m) => m.name === 'a'); ) {
+    assert.ok(Date.now() < deadline, 'b never learned of the revocation')
+    await new Promise((r) => setTimeout(r, 20))
+  }
   await assert.rejects(a.dial('admin@b'))
 })
 

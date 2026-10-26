@@ -177,10 +177,25 @@ func TestAllowlistAndRevoke(t *testing.T) {
 			t.Fatal("revoked node still listed")
 		}
 	}
+	// The revocation reaches b within moments; from then on, a is refused.
+	for deadline := time.Now().Add(5 * time.Second); hasMember(b, "a"); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("b never learned of the revocation")
+		}
+	}
 	if _, err := a.Dial(ctx, "admin@b"); err == nil {
 		t.Fatal("revoked node could still dial")
 	}
 	ln.Close()
+}
+
+func hasMember(n *Node, name string) bool {
+	for _, m := range n.Members() {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAddAndRemoveRelay(t *testing.T) {

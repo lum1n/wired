@@ -77,6 +77,12 @@ private func localAnchor() async throws -> WiredNode {
     let fresh = try vps.revoke(name: "a")
     #expect(fresh.hasPrefix("wired1"))
     #expect(!vps.members().contains { $0.name == "a" })
+    // The revocation reaches b within moments; from then on, a is refused.
+    let deadline = ContinuousClock.now + .seconds(5)
+    while b.members().contains(where: { $0.name == "a" }) && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(!b.members().contains { $0.name == "a" })
     await #expect(throws: WiredError.self) { try await a.dial(target: "admin@b") }
 
     listener.close()
