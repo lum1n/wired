@@ -108,8 +108,10 @@ impl Running {
         self.http.abort();
         let _ = self.http.await;
         self.service.shutdown().await;
+        // It waits for its connections to close, and one whose client vanished mid-handshake
+        // (a node closed right after it started) lingers until its 30 s idle timeout.
         if let Some(qad) = self.qad {
-            let _ = qad.shutdown().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), qad.shutdown()).await;
         }
     }
 }
