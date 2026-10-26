@@ -11,12 +11,20 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use data_encoding::HEXLOWER;
 use iroh::SecretKey;
-use iroh_relay::server::{
-    Access, AccessControl, CertConfig, ClientRequest, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig,
+use iroh_relay::{
+    KeyCache,
+    defaults::DEFAULT_KEY_CACHE_CAPACITY,
+    server::{
+        Access, AccessControl, ClientRequest, Metrics, QuicConfig, Server, ServerConfig,
+        http_server::{Handlers, RelayService},
+    },
 };
 use sha2::{Digest, Sha256};
+use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::{invite::RelayInfo, tls};
+
+mod http;
 
 /// How this node serves a relay.
 #[derive(Debug, Clone)]
@@ -85,7 +93,25 @@ pub(crate) struct ServedRelay {
     /// internal address, where nothing serves HTTPS), or a router without hairpin NAT.
     pub(crate) self_url: String,
     /// Taken by `Node::close`, which shuts it down so its port is free again at once.
-    pub(crate) server: std::sync::Mutex<Option<Server>>,
+    running: std::sync::Mutex<Option<Running>>,
+}
+
+/// The relay's listener, the relay itself (its clients), and its address discovery.
+struct Running {
+    http: JoinHandle<()>,
+    service: RelayService,
+    qad: Option<Server>,
+}
+
+impl Running {
+    async fn stop(self) {
+        self.http.abort();
+        let _ = self.http.await;
+        self.service.shutdown().await;
+        if let Some(qad) = self.qad {
+            let _ = qad.shutdown().await;
+        }
+    }
 }
 
 impl ServedRelay {
@@ -96,9 +122,9 @@ impl ServedRelay {
 
     /// Stops it, disconnecting its clients so they look for another relay.
     pub(crate) async fn shutdown(&self) {
-        let server = self.server.lock().unwrap().take();
-        if let Some(server) = server {
-            let _ = server.shutdown().await;
+        let running = self.running.lock().unwrap().take();
+        if let Some(running) = running {
+            running.stop().await;
         }
     }
 }
@@ -107,57 +133,69 @@ impl Drop for ServedRelay {
     /// A relay server dropped without shutting down stops accepting but keeps the clients it has,
     /// which then stay attached to it, looking connected. So it is shut down here too.
     fn drop(&mut self) {
-        if let Some(server) = self.server.get_mut().unwrap().take()
+        if let Some(running) = self.running.get_mut().unwrap().take()
             && let Ok(rt) = tokio::runtime::Handle::try_current()
         {
-            rt.spawn(async move {
-                let _ = server.shutdown().await;
-            });
+            rt.spawn(running.stop());
         }
     }
 }
 
 pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8; 16]) -> Result<ServedRelay> {
+    start_with(serve, key, network_id, http::ADMIT_TIMEOUT).await
+}
+
+async fn start_with(
+    serve: &RelayServe,
+    key: &SecretKey,
+    network_id: &[u8; 16],
+    admit_timeout: std::time::Duration,
+) -> Result<ServedRelay> {
     let denied = Arc::new(RwLock::new(BTreeSet::new()));
     let access = Arc::new(RelayAccess { token: token(network_id), denied: denied.clone() });
-    let mut config = ServerConfig::default();
-    let (server, info, local_addr) = match serve {
-        RelayServe::Public { bind, qad_bind, public_host } => {
-            let tls_config = tls::relay_server_config(key)?;
-            let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-            relay.tls = Some(TlsConfig::new(*bind, CertConfig::Manual { server_config: tls_config.clone() }));
-            relay.access = access;
-            config.relay = Some(relay);
-            config.quic = qad_bind.map(|addr| {
-                let mut q = QuicConfig::new(addr);
-                q.server_config = Some(tls_config);
-                q
-            });
-            let server = Server::spawn(config).await.context("start relay")?;
-            let https = server.https_addr().context("relay has no https address")?;
+    let service = RelayService::new(
+        Handlers::default(),
+        Default::default(),
+        None,
+        KeyCache::new(DEFAULT_KEY_CACHE_CAPACITY),
+        access,
+        Arc::new(Metrics::default()),
+    );
+    let (bind, tls_config, qad_bind) = match serve {
+        RelayServe::Public { bind, qad_bind, .. } => (*bind, Some(tls::relay_server_config(key)?), *qad_bind),
+        RelayServe::BehindProxy { bind, .. } => (*bind, None, None),
+    };
+    let listener = TcpListener::bind(bind).await.with_context(|| format!("start relay on {bind}"))?;
+    let local_addr = listener.local_addr()?;
+    let qad = match (qad_bind, &tls_config) {
+        (Some(addr), Some(tls_config)) => {
+            let mut q = QuicConfig::new(addr);
+            q.server_config = Some(tls_config.clone());
+            let mut config = ServerConfig::default();
+            config.quic = Some(q);
+            Some(Server::spawn(config).await.context("start relay address discovery")?)
+        }
+        _ => None,
+    };
+    let info = match serve {
+        RelayServe::Public { public_host, .. } => {
             let host = match public_host {
                 Some(h) => h.clone(),
                 None => crate::node::detect_host().await,
             };
-            let info = RelayInfo {
-                url: origin(&format!("https://{}:{}", url_host(&host), https.port()))?,
+            RelayInfo {
+                url: origin(&format!("https://{}:{}", url_host(&host), local_addr.port()))?,
                 pin: Some(*key.public().as_bytes()),
-                qad_port: server.quic_addr().map(|a| a.port()),
+                qad_port: qad.as_ref().and_then(|q| q.quic_addr()).map(|a| a.port()),
                 owner: Some(*key.public().as_bytes()),
-            };
-            (server, info, https)
+            }
         }
-        RelayServe::BehindProxy { bind, url } => {
-            let url = origin(url)?;
-            let mut relay = RelayConfig::new(*bind);
-            relay.access = access;
-            config.relay = Some(relay);
-            let server = Server::spawn(config).await.context("start relay")?;
-            let http = server.http_addr().context("relay has no http address")?;
-            let info = RelayInfo { url, pin: None, qad_port: None, owner: Some(*key.public().as_bytes()) };
-            (server, info, http)
+        RelayServe::BehindProxy { url, .. } => {
+            RelayInfo { url: origin(url)?, pin: None, qad_port: None, owner: Some(*key.public().as_bytes()) }
         }
     };
+    let tls = tls_config.map(|c| tokio_rustls::TlsAcceptor::from(Arc::new(c)));
+    let http = http::serve(listener, tls, service.clone(), admit_timeout);
     let ip = match local_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -166,7 +204,8 @@ pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8;
     // A public relay's certificate is pinned by key, so the local address verifies as well.
     let scheme = if info.pin.is_some() { "https" } else { "http" };
     let self_url = format!("{scheme}://{}", SocketAddr::new(ip, local_addr.port()));
-    Ok(ServedRelay { info, local_addr, denied, self_url, server: std::sync::Mutex::new(Some(server)) })
+    let running = Running { http, service, qad };
+    Ok(ServedRelay { info, local_addr, denied, self_url, running: std::sync::Mutex::new(Some(running)) })
 }
 
 /// `[v6]` for IPv6 literals, as URLs and `host:port` need.
@@ -212,6 +251,46 @@ mod tests {
         assert_eq!(token(&[1; 16]), token(&[1; 16]));
         assert_ne!(token(&[1; 16]), token(&[2; 16]));
         assert_eq!(token(&[1; 16]).len(), 32);
+    }
+
+    /// Sends `request` to `addr` and returns the response head.
+    async fn http(addr: SocketAddr, request: &str) -> (tokio::net::TcpStream, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(s.read(&mut b).await.unwrap(), 1, "closed early: {}", String::from_utf8_lossy(&head));
+            head.push(b[0]);
+        }
+        (s, String::from_utf8(head).unwrap())
+    }
+
+    /// A stranger that upgrades to a WebSocket and then never finishes the relay
+    /// handshake (it has no token) is cut off, rather than held forever.
+    #[tokio::test]
+    async fn a_connection_that_is_never_admitted_is_closed() {
+        use tokio::io::AsyncReadExt;
+
+        let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
+        let timeout = std::time::Duration::from_secs(1);
+        let relay = start_with(&serve, &SecretKey::generate(), &[3; 16], timeout).await.unwrap();
+        let (_, ping) = http(relay.local_addr, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(ping.starts_with("HTTP/1.1 200"), "{ping}");
+
+        let upgrade = "GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
+            Sec-WebSocket-Protocol: iroh-relay-v2\r\n\r\n";
+        let (mut s, head) = http(relay.local_addr, upgrade).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let closed = tokio::time::timeout(timeout * 5, async {
+            let mut buf = [0u8; 256];
+            while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "an unadmitted connection is still open");
+        relay.shutdown().await;
     }
 
     /// A relay dropped without `Node::close`, as when a first join fails, must not keep its

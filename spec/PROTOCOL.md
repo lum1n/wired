@@ -26,6 +26,8 @@ A relay is listed as `RelayInfo { url, pin, qad_port, owner }`. There are two ki
 
 The token keeps strangers off the relay's bandwidth; it is not what protects traffic.
 
+A relay closes any connection it hasn't admitted within 30 seconds, and lets at most 256 wait at once.
+
 **Listing.** A relay gets into the network in one of two ways:
 - The root adds it (`add_relay`). This is needed to bootstrap: a node can only join through a relay that the root is already connected to.
 - A node that serves one announces it in `Join`, and the root records it with that node as `owner`. Revoking the owner removes its relays.
