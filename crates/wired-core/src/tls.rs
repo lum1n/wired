@@ -60,11 +60,35 @@ fn cert_key(cert: &CertificateDer<'_>) -> Option<PublicKey> {
     PublicKey::from_bytes(raw).ok()
 }
 
-/// Keys of self-signed relays we trust; grows as relays are added.
-pub type Pinned = Arc<RwLock<Vec<PublicKey>>>;
+/// A self-signed relay's key, trusted only for the host of the relay's URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    host: String,
+    key: PublicKey,
+}
 
-/// Accepts a certificate whose key is pinned, or else one that chains to the
-/// usual CA roots (Mozilla's and the system's) for the server name.
+impl Pin {
+    /// The pin for a relay at `url` whose certificate carries `key`.
+    pub fn new(url: &str, key: PublicKey) -> Result<Self> {
+        let url = url::Url::parse(url).with_context(|| format!("bad relay url {url}"))?;
+        let host = match url.host().with_context(|| format!("relay url {url} has no host"))? {
+            url::Host::Domain(d) => d.to_ascii_lowercase(),
+            url::Host::Ipv4(ip) => ip.to_string(),
+            url::Host::Ipv6(ip) => ip.to_string(),
+        };
+        Ok(Self { host, key })
+    }
+
+    fn matches(&self, server_name: &ServerName<'_>, key: &PublicKey) -> bool {
+        self.key == *key && self.host == server_name.to_str().trim_end_matches('.').to_ascii_lowercase()
+    }
+}
+
+/// Keys of self-signed relays we trust, each for its own host; grows as relays are added.
+pub type Pinned = Arc<RwLock<Vec<Pin>>>;
+
+/// Accepts a certificate whose key is pinned for the server name, or else one
+/// that chains to the usual CA roots (Mozilla's and the system's) for it.
 pub struct PinnedVerifier {
     pinned: Pinned,
     provider: Arc<CryptoProvider>,
@@ -83,8 +107,13 @@ impl PinnedVerifier {
         Ok(Self { pinned, provider, webpki })
     }
 
-    fn is_pinned(&self, cert: &CertificateDer<'_>) -> bool {
-        cert_key(cert).is_some_and(|k| self.pinned.read().unwrap().contains(&k))
+    fn is_pinned(&self, cert: &CertificateDer<'_>, server_name: &ServerName<'_>) -> bool {
+        cert_key(cert).is_some_and(|k| self.pinned.read().unwrap().iter().any(|p| p.matches(server_name, &k)))
+    }
+
+    /// Whether `cert` carries a key pinned for any host.
+    fn has_pinned_key(&self, cert: &CertificateDer<'_>) -> bool {
+        cert_key(cert).is_some_and(|k| self.pinned.read().unwrap().iter().any(|p| p.key == k))
     }
 }
 
@@ -103,7 +132,7 @@ impl ServerCertVerifier for PinnedVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.is_pinned(end_entity) {
+        if self.is_pinned(end_entity, server_name) {
             return Ok(ServerCertVerified::assertion());
         }
         self.webpki.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
@@ -116,7 +145,7 @@ impl ServerCertVerifier for PinnedVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         // Pinned relays speak TLS 1.3 only; TLS 1.2 is for CA-issued certificates.
-        if self.is_pinned(cert) {
+        if self.has_pinned_key(cert) {
             return Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOfferedOrEnabled));
         }
         self.webpki.verify_tls12_signature(message, cert, dss)
@@ -156,16 +185,41 @@ mod tests {
         relay_server_config(&sk).unwrap();
     }
 
+    fn verifier(pins: Vec<Pin>) -> PinnedVerifier {
+        PinnedVerifier::new(Arc::new(RwLock::new(pins)), provider()).unwrap()
+    }
+
+    fn accepts(v: &PinnedVerifier, cert: &CertificateDer<'_>, host: &str) -> bool {
+        let name = ServerName::try_from(host.to_string()).unwrap();
+        v.verify_server_cert(cert, &[], &name, &[], UnixTime::now()).is_ok()
+    }
+
     #[test]
     fn verifier_accepts_pinned_and_rejects_unpinned_self_signed() {
         let sk = SecretKey::generate();
         let (cert, _) = relay_cert(&sk).unwrap();
-        let name = ServerName::try_from("wired-anchor").unwrap();
-        let other =
-            PinnedVerifier::new(Arc::new(RwLock::new(vec![SecretKey::generate().public()])), provider()).unwrap();
         // Not pinned, and not CA-issued either.
-        assert!(other.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_err());
-        let pinned = PinnedVerifier::new(Arc::new(RwLock::new(vec![sk.public()])), provider()).unwrap();
-        assert!(pinned.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());
+        let other = verifier(vec![Pin::new("https://vps.example.com:7443", SecretKey::generate().public()).unwrap()]);
+        assert!(!accepts(&other, &cert, "vps.example.com"));
+        let pinned = verifier(vec![Pin::new("https://VPS.example.com:7443/", sk.public()).unwrap()]);
+        assert!(accepts(&pinned, &cert, "vps.example.com"));
+        assert!(accepts(&pinned, &cert, "vps.example.com."));
+    }
+
+    #[test]
+    fn a_pin_holds_only_for_its_relays_host() {
+        let sk = SecretKey::generate();
+        let (cert, _) = relay_cert(&sk).unwrap();
+        let v = verifier(vec![
+            Pin::new("https://mallory.example.com:7443", sk.public()).unwrap(),
+            Pin::new("https://[::1]:7443", sk.public()).unwrap(),
+        ]);
+        assert!(accepts(&v, &cert, "mallory.example.com"));
+        assert!(accepts(&v, &cert, "::1"));
+        // Mallory's key does not vouch for anyone else's relay.
+        for host in ["robin.exe.xyz", "vps.example.com", "127.0.0.1"] {
+            assert!(!accepts(&v, &cert, host), "{host}");
+        }
+        assert!(Pin::new("not a url", sk.public()).is_err());
     }
 }

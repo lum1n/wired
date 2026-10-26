@@ -115,15 +115,17 @@ async fn root_behind_nat_and_a_vm_relay_reach_each_other() {
     echo(&robin, "echo@home").await.unwrap();
     assert_eq!(home.path("robin"), Some(PathKind::Relay));
 
-    // The relay is listed once, with what robin announced about it.
+    // The relay is listed once, as the root added it: robin's announcement doesn't claim it.
     let relays = home.relays();
     assert_eq!(relays.len(), 1, "{relays:?}");
-    assert_eq!(relays[0].owner, Some(*robin.id().as_bytes()));
+    assert_eq!(relays[0].owner, None);
     let (url, _) = robin.served_relay().unwrap();
     assert_eq!(relays[0].url, url);
 
-    // Revoking robin drops its relay from the network.
+    // Revoking robin leaves the root's listing; only the root removes it.
     home.revoke("robin").unwrap();
+    assert_eq!(home.relays(), relays);
+    home.remove_relay(&url).unwrap();
     assert!(home.relays().is_empty());
 
     robin.close().await;

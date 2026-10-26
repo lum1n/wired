@@ -320,18 +320,25 @@ fn announced_relay(r: RelayInfo, owner: [u8; 32]) -> Result<RelayInfo> {
 }
 
 /// Lists a member's relay, replacing the one it listed before (one per member).
-/// A member never takes over a listing another node owns. It may claim one the
-/// root added for it (so it could join through it), as long as it adds no pin.
+/// A member never takes over a listing another node owns, nor one the root
+/// added (owner `None`): that stays the root's, so only the root removes it,
+/// and revoking the member who serves it leaves it listed.
 fn list_member_relay(s: &mut Snapshot, info: RelayInfo) -> bool {
     if s.relays.contains(&info) {
         return false;
     }
-    let claimable = |r: &RelayInfo| r.owner == info.owner || (r.owner.is_none() && info.pin.is_none());
     if let Some(r) = s.relays.iter().find(|r| same_url(&r.url, &info.url))
-        && !claimable(r)
+        && r.owner != info.owner
     {
-        warn!(url = %info.url, "ignoring a relay announcement for a listing another node owns");
-        return false;
+        if r.owner.is_some() {
+            warn!(url = %info.url, "ignoring a relay announcement for a listing another node owns");
+            return false;
+        }
+        // The root listed it already (e.g. so the member could join through it); only the
+        // member's earlier listing goes.
+        let before = s.relays.len();
+        s.relays.retain(|r| r.owner != info.owner);
+        return s.relays.len() != before;
     }
     s.relays.retain(|r| r.owner != info.owner && !same_url(&r.url, &info.url));
     s.relays.push(info);
@@ -464,15 +471,19 @@ mod tests {
         // Another node's listing stays as it is, pinned or not.
         assert!(!list_member_relay(&mut s, relay("https://root.example", None, Some(eve))));
         assert!(!list_member_relay(&mut s, relay("https://alice.example", Some(eve), Some(eve))));
-        // A root-added listing can be claimed by its server, but not re-pinned.
+        // A root-added listing stays the root's, pinned or not.
         assert!(!list_member_relay(&mut s, relay("https://admin.example", Some(eve), Some(eve))));
-        assert!(list_member_relay(&mut s, relay("https://admin.example", None, Some(eve))));
+        assert!(!list_member_relay(&mut s, relay("https://admin.example", None, Some(eve))));
         // A new announcement replaces the member's earlier one.
+        assert!(list_member_relay(&mut s, relay("https://eve1.example", None, Some(eve))));
         assert!(list_member_relay(&mut s, relay("https://eve2.example", None, Some(eve))));
         assert!(!list_member_relay(&mut s, relay("https://eve2.example", None, Some(eve))));
+        // Moving to the root's listing drops the member's own, and leaves the root's alone.
+        assert!(list_member_relay(&mut s, relay("https://admin.example", None, Some(eve))));
+        assert!(!list_member_relay(&mut s, relay("https://admin.example", None, Some(eve))));
         let urls: Vec<&str> = s.relays.iter().map(|r| r.url.as_str()).collect();
-        assert_eq!(urls, ["https://root.example", "https://alice.example", "https://eve2.example"]);
-        assert_eq!(s.relays[0].owner, Some(root));
-        assert_eq!(s.relays[1].owner, Some(alice));
+        assert_eq!(urls, ["https://root.example", "https://admin.example", "https://alice.example"]);
+        let owners: Vec<_> = s.relays.iter().map(|r| r.owner).collect();
+        assert_eq!(owners, [Some(root), None, Some(alice)]);
     }
 }
