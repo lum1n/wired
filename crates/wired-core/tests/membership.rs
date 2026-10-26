@@ -292,3 +292,28 @@ async fn a_root_restored_from_older_state_catches_up_from_its_replica() {
     }
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// The invite is a credential; a replica needs it only the first time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_restarts_from_saved_state_without_the_invite() {
+    init_logs();
+    let vps = root("vps").await;
+    let dir = temp_dir("replica");
+    let spawn_replica =
+        |invite: Option<Invite>| Node::builder("vps2").anchor(local_anchor(invite)).state_dir(&dir).spawn();
+    let vps2 = spawn_replica(Some(vps.invite().parse().unwrap())).await.unwrap();
+    vps.approve_anchor(vps2.id()).unwrap();
+    assert!(eventually(20, || vps.members().iter().any(|m| m.name == "vps2" && m.anchor)).await);
+    let id = vps2.id();
+    vps2.close().await;
+
+    let vps2 = spawn_replica(None).await.unwrap();
+    assert_eq!(vps2.id(), id);
+    assert!(!vps2.is_root());
+    let laptop = member("laptop", &vps.invite()).await.unwrap();
+    assert!(eventually(20, || vps2.members().iter().any(|m| m.name == "laptop")).await, "the replica isn't syncing");
+    for n in [laptop, vps2, vps] {
+        n.close().await;
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

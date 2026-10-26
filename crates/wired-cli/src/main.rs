@@ -35,7 +35,9 @@ enum Cmd {
         #[arg(long, conflicts_with = "relay_url")]
         no_relay: bool,
         /// Run as a replica of this network (approve it on the root with `wired approve <id>`).
-        #[arg(long, value_name = "INVITE", hide_env_values = true)]
+        /// Prefer the environment variable: other local users can see command-line arguments.
+        /// Needed only the first time; a replica restarts from its saved state.
+        #[arg(long, value_name = "INVITE", env = "WIRED_REPLICA_OF", hide_env_values = true)]
         replica_of: Option<String>,
         #[command(flatten)]
         relay: RelayArgs,

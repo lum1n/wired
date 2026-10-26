@@ -132,8 +132,9 @@ Admin commands talk to the running anchor through a local socket in its state di
 The first anchor is the **root**. Its key is the network's trust anchor. Add replicas on other hosts for redundancy:
 
 ```sh
-# vps2
-wired anchor --name vps2 --replica-of wired1…    # prints its id
+# vps2: the invite only the first time, and not as an argument (other users can see those)
+export WIRED_REPLICA_OF=wired1…
+wired anchor --name vps2    # prints its id
 # vps (root)
 wired approve <vps2-id>
 ```

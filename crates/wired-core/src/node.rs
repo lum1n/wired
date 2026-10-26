@@ -52,6 +52,7 @@ pub struct AnchorConfig {
     pub public_host: Option<String>,
     /// Run as a replica of the network this invite is for. Its key must be
     /// approved on the root anchor (`wired approve <id>`) before it serves.
+    /// Not needed once the state directory holds the replica's saved state.
     pub replica_of: Option<Invite>,
 }
 
@@ -853,10 +854,9 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     let saved_version = disk.as_ref().map(|d| d.snapshot.version);
     let me = *key.public().as_bytes();
     let (network_id, root, secret, snap, approved, cert) = match (&cfg.replica_of, disk) {
-        (None, Some(d)) => {
-            ensure!(d.root == me, "this state directory belongs to a replica; pass its invite with --replica-of");
-            (d.network_id, d.root, d.secret, d.snapshot, d.approved, None)
-        }
+        (None, Some(d)) if d.root == me => (d.network_id, d.root, d.secret, d.snapshot, d.approved, None),
+        // A replica restarting: its saved state has all the invite had, and newer.
+        (None, Some(d)) => (d.network_id, d.root, d.secret, cached(d.snapshot), BTreeSet::new(), d.cert),
         (None, None) => (rand::random(), me, NetworkSecret::generate(), Snapshot::default(), BTreeSet::new(), None),
         (Some(inv), Some(d)) if d.network_id == inv.network_id && d.root == inv.root => {
             let snap = cached(d.snapshot);
