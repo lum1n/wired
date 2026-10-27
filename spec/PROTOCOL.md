@@ -17,7 +17,7 @@ This document is normative for every Wired implementation and binding.
 - Any node can serve one. Nodes connect to every listed relay as needed.
 
 A relay is listed as `RelayInfo { url, pin, qad_port, owner }`. There are two kinds:
-- **Public:** on a reachable host. HTTPS uses a self-signed certificate made from the serving node's key. `pin` is that key, and clients accept the certificate only if it carries it. QUIC address discovery runs on `qad_port`.
+- **Public:** on a reachable host. HTTPS uses a self-signed certificate made from the serving node's key. `pin` is that key, and clients accept the certificate only if it carries it, and only for the host in `url`: a pin never vouches for another relay's host. QUIC address discovery runs on `qad_port`.
 - **Behind a proxy:** a TLS-terminating proxy (exe.dev, nginx, Caddy) forwards `/relay` (a WebSocket) and `/ping` at the root of `url` to the relay's plain-HTTP socket. `pin` is `None`, so clients check the certificate against the usual CA roots: Mozilla's, and the system's (which honor `SSL_CERT_FILE` and `SSL_CERT_DIR`). There is no address discovery.
 
 **Access.** Relays admit a client only when both hold:
@@ -30,9 +30,9 @@ A relay closes any connection it hasn't admitted within 30 seconds, and lets at 
 
 **Listing.** A relay gets into the network in one of two ways:
 - The root adds it (`add_relay`). This is needed to bootstrap: a node can only join through a relay that the root is already connected to.
-- A node that serves one announces it in `Join`, and the root records it with that node as `owner`. Revoking the owner removes its relays.
+- A node that serves one announces it in `Join`, and the root records it with that node as `owner`, unless the root already listed that URL. Revoking the owner removes its relays.
 
-Relay URLs are origins (`https://host[:port]`, or `http://` for testing) of at most 256 bytes. A member lists at most one relay: a new announcement replaces its earlier one. It never replaces a listing another node owns. It may claim a listing the root added (owner `None`) when it announces no pin. A Public relay's `pin` must be the announcing node's key. Nodes skip any listed relay they cannot use, and still start.
+Relay URLs are origins (`https://host[:port]`, or `http://` for testing) of at most 256 bytes. A member lists at most one relay: a new announcement replaces its earlier one. It never replaces or claims a listing another node owns, nor one the root added (owner `None`): that stays the root's, and revoking the member who serves it leaves it listed. A Public relay's `pin` must be the announcing node's key. Nodes skip any listed relay they cannot use, and still start.
 
 ## Roles
 

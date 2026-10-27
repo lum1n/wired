@@ -622,7 +622,7 @@ impl Inner {
         };
         let token = relay::token(&self.network_id);
         for r in add {
-            if let Some(pin) = r.pin.and_then(|p| PublicKey::from_bytes(&p).ok()) {
+            if let Some(pin) = relay_pin(&r, self.relay.as_ref()) {
                 self.pinned.write().unwrap().push(pin);
             }
             match relay_config(&r, self.relay.as_ref(), &token) {
@@ -664,6 +664,13 @@ impl Inner {
 
 fn norm_url(u: &str) -> String {
     u.trim_end_matches('/').to_string()
+}
+
+/// The pin for a self-signed relay, bound to the host it is reached at.
+fn relay_pin(r: &RelayInfo, own: Option<&ServedRelay>) -> Option<tls::Pin> {
+    let key = PublicKey::from_bytes(&r.pin?).ok()?;
+    let reached = own.map_or(r.url.as_str(), |o| o.reach(&r.url));
+    tls::Pin::new(reached, key).inspect_err(|e| warn!(url = %r.url, "ignoring relay pin: {e:#}")).ok()
 }
 
 fn relay_config(r: &RelayInfo, own: Option<&ServedRelay>, token: &str) -> Result<iroh::RelayConfig> {
@@ -717,7 +724,7 @@ async fn bind_endpoint(
     bind: Option<SocketAddr>,
     relay_only: bool,
 ) -> Result<Bound> {
-    let pins = relays.iter().filter_map(|r| r.pin.and_then(|p| PublicKey::from_bytes(&p).ok())).collect();
+    let pins = relays.iter().filter_map(|r| relay_pin(r, own)).collect();
     let pinned: tls::Pinned = Arc::new(RwLock::new(pins));
     let token = relay::token(network_id);
     // A bad entry in a cached snapshot or an invite must not keep the node from starting.
