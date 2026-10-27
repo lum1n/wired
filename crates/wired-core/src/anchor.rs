@@ -46,13 +46,14 @@ impl Inner {
     /// Root: changes the network state, then persists and broadcasts it.
     /// `change` returns whether anything changed.
     pub(crate) fn update_snapshot(&self, change: impl FnOnce(&mut Snapshot) -> bool) {
+        let token = relay::token(&self.network_id, &self.secret.read().unwrap());
         let snap = {
             let mut guard = self.snap.write().unwrap();
             let mut next = (**guard).clone();
             if !change(&mut next) {
                 return;
             }
-            seal(&mut next, self.ep.secret_key());
+            seal(&mut next, self.ep.secret_key(), token);
             *guard = Arc::new(next);
             guard.clone()
         };
@@ -64,7 +65,7 @@ impl Inner {
     pub(crate) fn snapshot_changed(&self, snap: Arc<Snapshot>) {
         self.enforce_denied(&snap);
         if let Some(r) = &self.relay {
-            *r.denied.write().unwrap() = snap.denied.clone();
+            *r.admission.write().unwrap() = self.admission(&snap);
         }
         if let Some(me) = self.me.upgrade() {
             let snap = snap.clone();
@@ -259,6 +260,7 @@ impl Inner {
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             let c = cert::issue(self.ep.secret_key(), None, self.network_id, self.ep.id(), &self.name, Role::Anchor);
             *self.cert.write().unwrap() = Some(c);
+            self.announce_cert();
         }
     }
 
@@ -267,12 +269,13 @@ impl Inner {
     }
 }
 
-/// Root: moves `snap` to a new version and signs it. Versions are at least the
-/// clock in Unix milliseconds, so a root restarted from older state still
-/// outranks every snapshot it published before.
-pub(crate) fn seal(snap: &mut Snapshot, root: &SecretKey) {
+/// Root: moves `snap` to a new version, with the relay token of the current join
+/// secret, and signs it. Versions are at least the clock in Unix milliseconds, so a
+/// root restarted from older state still outranks every snapshot it published before.
+pub(crate) fn seal(snap: &mut Snapshot, root: &SecretKey, relay_token: [u8; 16]) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     snap.version = (snap.version + 1).max(now);
+    snap.relay_token = relay_token;
     snap.secret = None;
     snap.sign(root);
 }
@@ -389,7 +392,7 @@ impl Node {
     pub fn rotate_invite(&self) -> Result<String> {
         self.require_root("rotate the invite")?;
         self.inner.rotate_secret();
-        // Bump the version so replicas pick up the new secret.
+        // Bump the version so replicas pick up the new secret, and relays the new token.
         self.inner.update_snapshot(|_| true);
         Ok(self.invite())
     }

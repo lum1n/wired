@@ -41,7 +41,7 @@ impl Inner {
     fn anchor_order(&self) -> Vec<PublicKey> {
         let me = self.ep.id();
         let mut order = vec![self.root];
-        for a in &self.snapshot().anchors {
+        for a in &self.listed(&self.snapshot()).anchors {
             if let Ok(id) = PublicKey::from_bytes(&a.id)
                 && id != self.root
             {
@@ -94,7 +94,7 @@ impl Inner {
         };
         let theirs = self.join_on(&conn).await?;
         if fresh {
-            self.add_peer(conn.clone(), theirs.body.name.clone(), theirs.body.issuer);
+            self.add_peer(conn.clone(), &theirs);
         }
         let (mut send, mut recv) = conn.open_bi().await?;
         frame::write(&mut send, &Open::Watch).await?;
@@ -130,6 +130,7 @@ impl Inner {
         if mine.body.role == want {
             *self.cert.write().unwrap() = Some(mine);
             self.persist();
+            self.announce_cert();
         } else if self.cert.read().unwrap().is_none() {
             // A replica only gets anchor certificates from the root.
             bail!("{} issued a {:?} certificate; waiting for the root", theirs.body.name, mine.body.role);
@@ -144,13 +145,20 @@ impl Inner {
             warn!("ignoring a snapshot the root did not sign: {e:#}");
             return;
         }
-        let snap = {
+        // An anchor answered: from now on the network's own lists are the ones to use.
+        let seeded = self.seed.lock().unwrap().take().is_some();
+        let newer = {
             let mut cur = self.snap.write().unwrap();
-            if snap.version <= cur.version {
-                return;
+            (snap.version > cur.version).then(|| {
+                *cur = Arc::new(snap);
+                cur.clone()
+            })
+        };
+        let Some(snap) = newer else {
+            if seeded {
+                self.learn_network(&self.snapshot()).await;
             }
-            *cur = Arc::new(snap);
-            cur.clone()
+            return;
         };
         if let Some(secret) = secret
             && self.anchor.is_some()

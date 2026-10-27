@@ -22,7 +22,11 @@ use iroh_relay::{
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, task::JoinHandle};
 
-use crate::{invite::RelayInfo, tls};
+use crate::{
+    invite::{NetworkSecret, RelayInfo},
+    proto::Snapshot,
+    tls,
+};
 
 mod http;
 
@@ -54,31 +58,66 @@ impl RelayServe {
     }
 }
 
-/// Bearer token nodes present to the network's relays. It keeps strangers off
-/// the relays' bandwidth; it is not what protects traffic (that is end to end).
-pub fn token(network_id: &[u8; 16]) -> String {
+/// The relay token for a join secret: what a node the network doesn't know yet presents to
+/// relays, so it can join through them. Rotating the secret (as revoking a node does) changes
+/// it, so an old invite no longer gets a fresh key onto the relays. It keeps strangers off the
+/// relays' bandwidth; it is not what protects traffic (that is end to end).
+pub fn token(network_id: &[u8; 16], secret: &NetworkSecret) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(b"wired/1 relay-token");
     h.update(network_id);
-    HEXLOWER.encode(&h.finalize()[..16])
+    h.update(secret.0);
+    h.finalize()[..16].try_into().expect("16 bytes")
 }
 
-/// Admits nodes with the network's token whose key is not revoked.
+/// `token` as nodes present it: `Authorization: Bearer <hex>`.
+pub fn bearer(token: &[u8; 16]) -> String {
+    HEXLOWER.encode(token)
+}
+
+/// Whom a relay admits, as of the network state it last saw.
+#[derive(Debug, Default)]
+pub(crate) struct Admission {
+    /// Members' keys, admitted whatever token they present.
+    members: BTreeSet<[u8; 32]>,
+    denied: BTreeSet<[u8; 32]>,
+    /// Admits a key the network doesn't know yet, so it can join.
+    token: Option<String>,
+}
+
+impl Admission {
+    /// As of `snap`. `keys` are admitted besides its members: the root's and the serving
+    /// node's, so a relay with no state yet lets its own node join through it. Until the
+    /// relay has state the root signed, the token is the one of the join secret it knows.
+    pub(crate) fn new(snap: &Snapshot, keys: [[u8; 32]; 2], network_id: &[u8; 16], secret: &NetworkSecret) -> Self {
+        let token = if snap.sig.is_empty() { token(network_id, secret) } else { snap.relay_token };
+        Self {
+            members: snap.members.values().copied().chain(keys).collect(),
+            denied: snap.denied.clone(),
+            token: Some(bearer(&token)),
+        }
+    }
+}
+
+/// Admits members, and new nodes with the current relay token, unless their key is revoked.
 #[derive(Debug)]
 pub(crate) struct RelayAccess {
-    token: String,
-    pub(crate) denied: Arc<RwLock<BTreeSet<[u8; 32]>>>,
+    admission: Arc<RwLock<Admission>>,
 }
 
 impl AccessControl for RelayAccess {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
-        if request.auth_token().as_deref() != Some(self.token.as_str()) {
-            return Access::Deny { reason: Some("not a member of this network".into()) };
-        }
-        if self.denied.read().unwrap().contains(request.endpoint_id().as_bytes()) {
+        let key = request.endpoint_id();
+        let admission = self.admission.read().unwrap();
+        if admission.denied.contains(key.as_bytes()) {
             return Access::Deny { reason: Some("revoked".into()) };
         }
-        Access::Allow
+        if admission.members.contains(key.as_bytes())
+            || admission.token.as_ref().is_some_and(|t| request.auth_token().as_deref() == Some(t.as_str()))
+        {
+            return Access::Allow;
+        }
+        Access::Deny { reason: Some("not a member of this network".into()) }
     }
 }
 
@@ -87,7 +126,8 @@ pub(crate) struct ServedRelay {
     pub(crate) info: RelayInfo,
     /// Where it listens (for `BehindProxy`, what the proxy forwards to).
     pub(crate) local_addr: SocketAddr,
-    pub(crate) denied: Arc<RwLock<BTreeSet<[u8; 32]>>>,
+    /// Kept in line with the network state by the node serving it.
+    pub(crate) admission: Arc<RwLock<Admission>>,
     /// The URL this node itself reaches it at: its local address. The public URL may not lead
     /// back to the host it is served from: behind a proxy (on exe.dev it resolves to the VM's
     /// internal address, where nothing serves HTTPS), or a router without hairpin NAT.
@@ -143,18 +183,13 @@ impl Drop for ServedRelay {
     }
 }
 
-pub(crate) async fn start(serve: &RelayServe, key: &SecretKey, network_id: &[u8; 16]) -> Result<ServedRelay> {
-    start_with(serve, key, network_id, http::ADMIT_TIMEOUT).await
+pub(crate) async fn start(serve: &RelayServe, key: &SecretKey) -> Result<ServedRelay> {
+    start_with(serve, key, http::ADMIT_TIMEOUT).await
 }
 
-async fn start_with(
-    serve: &RelayServe,
-    key: &SecretKey,
-    network_id: &[u8; 16],
-    admit_timeout: std::time::Duration,
-) -> Result<ServedRelay> {
-    let denied = Arc::new(RwLock::new(BTreeSet::new()));
-    let access = Arc::new(RelayAccess { token: token(network_id), denied: denied.clone() });
+async fn start_with(serve: &RelayServe, key: &SecretKey, admit_timeout: std::time::Duration) -> Result<ServedRelay> {
+    let admission = Arc::new(RwLock::new(Admission::default()));
+    let access = Arc::new(RelayAccess { admission: admission.clone() });
     let service = RelayService::new(
         Handlers::default(),
         Default::default(),
@@ -207,7 +242,7 @@ async fn start_with(
     let scheme = if info.pin.is_some() { "https" } else { "http" };
     let self_url = format!("{scheme}://{}", SocketAddr::new(ip, local_addr.port()));
     let running = Running { http, service, qad };
-    Ok(ServedRelay { info, local_addr, denied, self_url, running: std::sync::Mutex::new(Some(running)) })
+    Ok(ServedRelay { info, local_addr, admission, self_url, running: std::sync::Mutex::new(Some(running)) })
 }
 
 /// `[v6]` for IPv6 literals, as URLs and `host:port` need.
@@ -249,10 +284,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_depends_on_network() {
-        assert_eq!(token(&[1; 16]), token(&[1; 16]));
-        assert_ne!(token(&[1; 16]), token(&[2; 16]));
-        assert_eq!(token(&[1; 16]).len(), 32);
+    fn token_depends_on_network_and_secret() {
+        let (s1, s2) = (NetworkSecret([1; 32]), NetworkSecret([2; 32]));
+        assert_eq!(token(&[1; 16], &s1), token(&[1; 16], &s1));
+        assert_ne!(token(&[1; 16], &s1), token(&[2; 16], &s1));
+        assert_ne!(token(&[1; 16], &s1), token(&[1; 16], &s2));
+        assert_eq!(bearer(&token(&[1; 16], &s1)).len(), 32);
     }
 
     /// Sends `request` to `addr` and returns the response head.
@@ -277,7 +314,7 @@ mod tests {
 
         let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
         let timeout = std::time::Duration::from_secs(1);
-        let relay = start_with(&serve, &SecretKey::generate(), &[3; 16], timeout).await.unwrap();
+        let relay = start_with(&serve, &SecretKey::generate(), timeout).await.unwrap();
         let (_, ping) = http(relay.local_addr, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(ping.starts_with("HTTP/1.1 200"), "{ping}");
 
@@ -303,15 +340,15 @@ mod tests {
 
         let key = SecretKey::generate();
         let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: "http://127.0.0.1".into() };
-        let relay = start(&serve, &key, &[3; 16]).await.unwrap();
+        let relay = start(&serve, &key).await.unwrap();
         let url: iroh::RelayUrl = format!("http://{}", relay.local_addr).parse().unwrap();
-        let mut client =
-            iroh_relay::client::ClientBuilder::new(url, SecretKey::generate(), iroh::dns::DnsResolver::new())
-                .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
-                .auth_token(token(&[3; 16]))
-                .connect()
-                .await
-                .unwrap();
+        let member = SecretKey::generate();
+        relay.admission.write().unwrap().members.insert(*member.public().as_bytes());
+        let mut client = iroh_relay::client::ClientBuilder::new(url, member, iroh::dns::DnsResolver::new())
+            .tls_client_config(iroh::tls::CaTlsConfig::default().client_config(tls::provider()).unwrap())
+            .connect()
+            .await
+            .unwrap();
         drop(relay);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(Ok(_)) = client.next().await {}
@@ -338,7 +375,7 @@ mod tests {
     async fn reach_maps_only_our_relay_to_its_local_address() {
         let serve =
             RelayServe::BehindProxy { bind: "0.0.0.0:0".parse().unwrap(), url: "https://robin.exe.xyz/".into() };
-        let relay = start(&serve, &SecretKey::generate(), &[3; 16]).await.unwrap();
+        let relay = start(&serve, &SecretKey::generate()).await.unwrap();
         assert_eq!(relay.info.url, "https://robin.exe.xyz");
         let local = format!("http://127.0.0.1:{}", relay.local_addr.port());
         assert_eq!(relay.self_url, local, "an unspecified bind is reached at loopback, over plain http");
@@ -355,7 +392,7 @@ mod tests {
             qad_bind: None,
             public_host: Some("vps.example.com".into()),
         };
-        let relay = start(&serve, &SecretKey::generate(), &[3; 16]).await.unwrap();
+        let relay = start(&serve, &SecretKey::generate()).await.unwrap();
         let port = relay.local_addr.port();
         assert_eq!(relay.info.url, format!("https://vps.example.com:{port}"));
         assert_eq!(relay.reach(&relay.info.url), format!("https://127.0.0.1:{port}"));
@@ -367,7 +404,7 @@ mod tests {
         let key = SecretKey::generate();
         for url in ["https://r.example/relay", "https://r.example/?x=1", "ftp://r.example"] {
             let serve = RelayServe::BehindProxy { bind: "127.0.0.1:0".parse().unwrap(), url: url.into() };
-            assert!(start(&serve, &key, &[3; 16]).await.is_err(), "{url} was accepted");
+            assert!(start(&serve, &key).await.is_err(), "{url} was accepted");
         }
     }
 }

@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64},
     task::{Context as TaskCx, Poll},
 };
 
@@ -30,7 +30,7 @@ use crate::{
     invite::{AnchorInfo, Invite, NetworkSecret, RelayInfo},
     peer::is_fatal,
     proto::{ALPN, Cert, Role, Snapshot},
-    relay::{self, RelayServe, ServedRelay},
+    relay::{self, Admission, RelayServe, ServedRelay},
     state::{self, AnchorDisk, MemberDisk},
     tls,
 };
@@ -214,7 +214,11 @@ pub(crate) struct Inner {
     /// Our certificate; `None` until the first join.
     pub(crate) cert: RwLock<Option<Cert>>,
     /// Latest network state. Authoritative on the root, replicated elsewhere.
+    /// Once the root signed it, only ever what it signed: other lists go in `seed`.
     pub(crate) snap: RwLock<Arc<Snapshot>>,
+    /// The anchors and relays the invite lists, when the node started from saved state the
+    /// root signed: used beside that state's until the node first hears from an anchor.
+    pub(crate) seed: Mutex<Option<Seed>>,
     /// Woken on every new snapshot, for a dial that waits on a name just joined.
     pub(crate) snap_changed: tokio::sync::Notify,
     pub(crate) services: Mutex<HashMap<String, Service>>,
@@ -230,6 +234,19 @@ pub(crate) struct Inner {
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// Where to look for the network before an anchor has told us.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Seed {
+    pub(crate) anchors: Vec<AnchorInfo>,
+    pub(crate) relays: Vec<RelayInfo>,
+}
+
+impl Seed {
+    fn of(invite: &Invite) -> Self {
+        Self { anchors: invite.anchors.clone(), relays: invite.relays.clone() }
+    }
+}
+
 pub(crate) struct Service {
     pub(crate) tx: mpsc::Sender<Stream>,
     /// Node names allowed to open this service; `None` allows every member.
@@ -242,6 +259,9 @@ pub(crate) struct Peer {
     pub(crate) name: String,
     /// Who issued the peer's certificate; revoking it drops this peer.
     pub(crate) issuer: [u8; 32],
+    /// When the peer's certificate expires (Unix seconds); the connection closes then.
+    /// The peer moves it on by showing a renewed one.
+    pub(crate) expires: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Node {
@@ -565,14 +585,32 @@ impl Inner {
     }
 
     pub(crate) fn invite(&self) -> Invite {
-        let snap = self.snapshot();
-        Invite::new(
-            self.network_id,
-            *self.root.as_bytes(),
-            self.secret.read().unwrap().clone(),
-            snap.anchors.clone(),
-            snap.relays.clone(),
-        )
+        let Seed { anchors, relays } = self.listed(&self.snapshot());
+        Invite::new(self.network_id, *self.root.as_bytes(), self.secret.read().unwrap().clone(), anchors, relays)
+    }
+
+    /// The anchors and relays in `snap`, and the seed's while the node has one.
+    pub(crate) fn listed(&self, snap: &Snapshot) -> Seed {
+        let listed = Seed { anchors: snap.anchors.clone(), relays: snap.relays.clone() };
+        match &*self.seed.lock().unwrap() {
+            Some(seed) => Seed {
+                anchors: merge(listed.anchors, &seed.anchors, |a| a.id),
+                relays: merge(listed.relays, &seed.relays, |r| norm_url(&r.url)),
+            },
+            None => listed,
+        }
+    }
+
+    /// Whom the relay this node serves admits, as of `snap`.
+    pub(crate) fn admission(&self, snap: &Snapshot) -> Admission {
+        let keys = [*self.root.as_bytes(), *self.ep.id().as_bytes()];
+        Admission::new(snap, keys, &self.network_id, &self.secret.read().unwrap())
+    }
+
+    /// What this node presents to relays: the token of the join secret it knows. Once it is a
+    /// member, relays admit it by its key, so a token gone stale since it joined does no harm.
+    fn relay_bearer(&self) -> String {
+        relay::bearer(&relay::token(&self.network_id, &self.secret.read().unwrap()))
     }
 
     /// Writes what this node needs to restart (and, on the root, the invite).
@@ -609,18 +647,20 @@ impl Inner {
     /// Brings the endpoint in line with the network: connects to new relays,
     /// drops removed ones (never our own), and refreshes anchor addresses.
     pub(crate) async fn learn_network(&self, snap: &Snapshot) {
+        let listed = self.listed(snap);
         let own = self.relay.as_ref().map(|r| norm_url(&r.info.url));
         let (add, remove) = {
             let mut known = self.known_relays.lock().unwrap();
-            let want: BTreeSet<String> = snap.relays.iter().map(|r| norm_url(&r.url)).chain(own.clone()).collect();
-            let add: Vec<RelayInfo> = snap.relays.iter().filter(|r| known.insert(norm_url(&r.url))).cloned().collect();
+            let want: BTreeSet<String> = listed.relays.iter().map(|r| norm_url(&r.url)).chain(own.clone()).collect();
+            let add: Vec<RelayInfo> =
+                listed.relays.iter().filter(|r| known.insert(norm_url(&r.url))).cloned().collect();
             let remove: Vec<String> = known.iter().filter(|u| !want.contains(*u)).cloned().collect();
             for u in &remove {
                 known.remove(u);
             }
             (add, remove)
         };
-        let token = relay::token(&self.network_id);
+        let token = self.relay_bearer();
         for r in add {
             if let Some(pin) = relay_pin(&r, self.relay.as_ref()) {
                 self.pinned.write().unwrap().push(pin);
@@ -637,8 +677,8 @@ impl Inner {
                 self.ep.remove_relay(&url).await;
             }
         }
-        let relays = self.relay_urls_of(snap);
-        for a in &snap.anchors {
+        let relays = self.relay_urls_of(&listed.relays);
+        for a in &listed.anchors {
             if let Ok(id) = PublicKey::from_bytes(&a.id)
                 && id != self.ep.id()
             {
@@ -649,11 +689,11 @@ impl Inner {
 
     /// Relay URLs to reach a peer through: every relay in the network.
     pub(crate) fn relay_urls(&self) -> Vec<RelayUrl> {
-        self.relay_urls_of(&self.snapshot())
+        self.relay_urls_of(&self.listed(&self.snapshot()).relays)
     }
 
-    fn relay_urls_of(&self, snap: &Snapshot) -> Vec<RelayUrl> {
-        snap.relays.iter().filter_map(|r| self.reach(&r.url).parse().ok()).collect()
+    fn relay_urls_of(&self, relays: &[RelayInfo]) -> Vec<RelayUrl> {
+        relays.iter().filter_map(|r| self.reach(&r.url).parse().ok()).collect()
     }
 
     /// The URL this node uses for a network relay: the relay it serves at its local address.
@@ -718,7 +758,7 @@ struct Bound {
 
 async fn bind_endpoint(
     key: SecretKey,
-    network_id: &[u8; 16],
+    token: &str,
     relays: &[RelayInfo],
     own: Option<&ServedRelay>,
     bind: Option<SocketAddr>,
@@ -726,11 +766,10 @@ async fn bind_endpoint(
 ) -> Result<Bound> {
     let pins = relays.iter().filter_map(|r| relay_pin(r, own)).collect();
     let pinned: tls::Pinned = Arc::new(RwLock::new(pins));
-    let token = relay::token(network_id);
     // A bad entry in a cached snapshot or an invite must not keep the node from starting.
     let map: RelayMap = relays
         .iter()
-        .filter_map(|r| relay_config(r, own, &token).inspect_err(|e| warn!(url = %r.url, "ignoring relay: {e:#}")).ok())
+        .filter_map(|r| relay_config(r, own, token).inspect_err(|e| warn!(url = %r.url, "ignoring relay: {e:#}")).ok())
         .collect();
     let lookup = MemoryLookup::new();
     let mut net_report = NetReportConfig::default();
@@ -761,15 +800,12 @@ fn new_inner(
     secret: NetworkSecret,
     cert: Option<Cert>,
     snap: Snapshot,
+    seed: Option<Seed>,
     anchor: Option<AnchorState>,
     relay: Option<ServedRelay>,
     dir: Option<PathBuf>,
 ) -> Arc<Inner> {
-    // The relay this node serves refuses revoked keys from the start, not from the next snapshot.
-    if let Some(r) = &relay {
-        *r.denied.write().unwrap() = snap.denied.clone();
-    }
-    Arc::new_cyclic(|me| Inner {
+    let inner = Arc::new_cyclic(|me| Inner {
         me: me.clone(),
         rt: tokio::runtime::Handle::current(),
         name,
@@ -779,6 +815,7 @@ fn new_inner(
         secret: RwLock::new(secret),
         cert: RwLock::new(cert),
         snap: RwLock::new(Arc::new(snap)),
+        seed: Mutex::new(seed),
         snap_changed: tokio::sync::Notify::new(),
         services: Mutex::new(HashMap::new()),
         peers: Mutex::new(HashMap::new()),
@@ -789,12 +826,17 @@ fn new_inner(
         known_relays: Mutex::new(bound.known),
         dir,
         tasks: Mutex::new(Vec::new()),
-    })
+    });
+    // The relay this node serves refuses revoked keys from the start, not from the next snapshot.
+    if let Some(r) = &inner.relay {
+        *r.admission.write().unwrap() = inner.admission(&inner.snapshot());
+    }
+    inner
 }
 
-async fn start_relay(b: &Builder, key: &SecretKey, network_id: &[u8; 16]) -> Result<Option<ServedRelay>> {
+async fn start_relay(b: &Builder, key: &SecretKey) -> Result<Option<ServedRelay>> {
     match &b.relay {
-        Some(serve) => Ok(Some(relay::start(serve, key, network_id).await?)),
+        Some(serve) => Ok(Some(relay::start(serve, key).await?)),
         None => Ok(None),
     }
 }
@@ -811,18 +853,17 @@ async fn spawn_member(b: Builder, key: SecretKey, dir: Option<PathBuf>) -> Resul
         }
         None => None,
     };
-    let (cert, mut snap) = match disk {
+    let (cert, snap) = match disk {
         Some(d) if d.cert.body.node_id == *key.public().as_bytes() => (Some(d.cert), cached(d.snapshot)),
         _ => (None, Snapshot::default()),
     };
-    snap.anchors = merge(snap.anchors, &invite.anchors, |a| a.id);
-    snap.relays = merge(snap.relays, &invite.relays, |r| norm_url(&r.url));
+    let (snap, seed) = seeded(snap, Some(&invite));
 
-    let relay = start_relay(&b, &key, &invite.network_id).await?;
-    let relays =
-        merge(snap.relays.clone(), &relay.iter().map(|r| r.info.clone()).collect::<Vec<_>>(), |r| norm_url(&r.url));
-    let bound = bind_endpoint(key, &invite.network_id, &relays, relay.as_ref(), None, b.relay_only).await?;
-    let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, None, relay, dir);
+    let relay = start_relay(&b, &key).await?;
+    let relays = startup_relays(&snap, seed.as_ref(), &own_relay(&relay));
+    let token = relay::bearer(&relay::token(&invite.network_id, &invite.secret));
+    let bound = bind_endpoint(key, &token, &relays, relay.as_ref(), None, b.relay_only).await?;
+    let inner = new_inner(b.name, bound, invite.network_id, root, invite.secret, cert, snap, seed, None, relay, dir);
     inner.learn_network(&inner.snapshot()).await;
 
     let cached = inner.cert.read().unwrap().as_ref().is_some_and(|c| cert::remaining(c) > 0);
@@ -870,28 +911,23 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
         (None, Some(d)) => (d.network_id, d.root, d.secret, cached(d.snapshot), BTreeSet::new(), d.cert),
         (None, None) => (rand::random(), me, NetworkSecret::generate(), Snapshot::default(), BTreeSet::new(), None),
         (Some(inv), Some(d)) if d.network_id == inv.network_id && d.root == inv.root => {
-            let snap = cached(d.snapshot);
-            let snap = Snapshot {
-                anchors: merge(snap.anchors.clone(), &inv.anchors, |a| a.id),
-                relays: merge(snap.relays.clone(), &inv.relays, |r| norm_url(&r.url)),
-                ..snap
-            };
-            (d.network_id, d.root, d.secret, snap, BTreeSet::new(), d.cert)
+            (d.network_id, d.root, d.secret, cached(d.snapshot), BTreeSet::new(), d.cert)
         }
         (Some(inv), _) => {
             ensure!(inv.root != me, "a replica cannot use the root's key");
-            let snap = Snapshot { anchors: inv.anchors.clone(), relays: inv.relays.clone(), ..Default::default() };
-            (inv.network_id, inv.root, inv.secret.clone(), snap, BTreeSet::new(), None)
+            (inv.network_id, inv.root, inv.secret.clone(), Snapshot::default(), BTreeSet::new(), None)
         }
     };
+    let (snap, seed) = seeded(snap, cfg.replica_of.as_ref());
     let root = PublicKey::from_bytes(&root).map_err(|e| anyhow!("bad root key: {e}"))?;
     let is_root = root == key.public();
 
-    let relay = start_relay(&b, &key, &network_id).await?;
-    let own_relay: Vec<RelayInfo> = relay.iter().map(|r| r.info.clone()).collect();
-    let relays = merge(snap.relays.clone(), &own_relay, |r| norm_url(&r.url));
+    let relay = start_relay(&b, &key).await?;
+    let own_relay = own_relay(&relay);
+    let relays = startup_relays(&snap, seed.as_ref(), &own_relay);
     let bind = (!b.relay_only).then_some(cfg.bind);
-    let bound = bind_endpoint(key.clone(), &network_id, &relays, relay.as_ref(), bind, b.relay_only).await?;
+    let token = relay::bearer(&relay::token(&network_id, &secret));
+    let bound = bind_endpoint(key.clone(), &token, &relays, relay.as_ref(), bind, b.relay_only).await?;
     let mut info = AnchorInfo { id: me, addrs: Vec::new() };
     if let Some(socket) = bound.ep.bound_sockets().first() {
         let host = match cfg.public_host.clone() {
@@ -902,7 +938,7 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     }
 
     let (snap, cert) = if is_root {
-        let snap = root_start(&snap, &key, &b.name, &info, &own_relay)?;
+        let snap = root_start(&snap, &key, &b.name, &info, &own_relay, &network_id, &secret)?;
         (snap, Some(cert::issue(&key, None, network_id, key.public(), &b.name, Role::Anchor)))
     } else {
         (snap, cert)
@@ -911,19 +947,18 @@ async fn spawn_anchor(b: Builder, cfg: AnchorConfig, key: SecretKey, dir: Option
     let (updates, _) = watch::channel(Arc::new(snap.clone()));
     let anchor =
         AnchorState { info: info.clone(), approved: Mutex::new(approved), updates, watches: Default::default() };
-    let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, Some(anchor), relay, dir.clone());
+    let inner = new_inner(b.name, bound, network_id, root, secret, cert, snap, seed, Some(anchor), relay, dir.clone());
     inner.learn_network(&inner.snapshot()).await;
     if is_root
         && let Some(since) = saved_version
         && let Some(newer) = inner.newest_from_anchors(since).await
     {
         // The saved state is older than what the network has: carry on from the newest.
-        match root_start(&newer, &key, &inner.name, &info, &own_relay) {
+        let secret = newer.secret.clone().unwrap_or_else(|| inner.secret.read().unwrap().clone());
+        match root_start(&newer, &key, &inner.name, &info, &own_relay, &network_id, &secret) {
             Ok(next) => {
                 warn!(saved = since, network = newer.version, "saved state was behind the network; caught up");
-                if let Some(secret) = newer.secret {
-                    *inner.secret.write().unwrap() = secret;
-                }
+                *inner.secret.write().unwrap() = secret;
                 *inner.snap.write().unwrap() = Arc::new(next);
                 inner.snapshot_changed(inner.snapshot());
             }
@@ -963,6 +998,32 @@ fn cached(mut snap: Snapshot) -> Snapshot {
     snap
 }
 
+/// Where a node starting with `invite` looks for the network. The invite's lists go into a
+/// snapshot the root never signed, so they are saved with it. One the root signed stays as it
+/// is, or the node would save and serve state that no longer verifies; they are kept beside it
+/// until an anchor answers.
+fn seeded(mut snap: Snapshot, invite: Option<&Invite>) -> (Snapshot, Option<Seed>) {
+    let Some(invite) = invite else { return (snap, None) };
+    let seed = Seed::of(invite);
+    if !snap.sig.is_empty() {
+        return (snap, Some(seed));
+    }
+    snap.anchors = merge(snap.anchors, &seed.anchors, |a| a.id);
+    snap.relays = merge(snap.relays, &seed.relays, |r| norm_url(&r.url));
+    (snap, None)
+}
+
+/// The relays a node's endpoint starts with: the network's, the seed's and its own.
+fn startup_relays(snap: &Snapshot, seed: Option<&Seed>, own: &[RelayInfo]) -> Vec<RelayInfo> {
+    let seeded = merge(snap.relays.clone(), seed.map_or(&[][..], |s| &s.relays[..]), |r| norm_url(&r.url));
+    merge(seeded, own, |r| norm_url(&r.url))
+}
+
+/// The relay this node serves, as listed.
+fn own_relay(relay: &Option<ServedRelay>) -> Vec<RelayInfo> {
+    relay.iter().map(|r| r.info.clone()).collect()
+}
+
 /// The root's snapshot as it starts: registered under its name, with its current
 /// address and relay, at a new version and signed.
 fn root_start(
@@ -971,6 +1032,8 @@ fn root_start(
     name: &str,
     info: &AnchorInfo,
     own_relay: &[RelayInfo],
+    network_id: &[u8; 16],
+    secret: &NetworkSecret,
 ) -> Result<Snapshot> {
     let me = *key.public().as_bytes();
     if let Some(owner) = snap.members.get(name)
@@ -986,7 +1049,7 @@ fn root_start(
     // Our own relay replaces whatever we served last time.
     next.relays.retain(|r| r.owner != Some(me));
     next.relays.extend(own_relay.iter().cloned());
-    crate::anchor::seal(&mut next, key);
+    crate::anchor::seal(&mut next, key, relay::token(network_id, secret));
     Ok(next)
 }
 
