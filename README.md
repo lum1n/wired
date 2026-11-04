@@ -122,7 +122,7 @@ The relay admits only this network's nodes (it checks a token derived from the n
 ## Access control
 
 - Restrict a service to named nodes with `--allow api=vps,desktop` on the CLI, or `listen_allow` / `expose_allow` in the library. Names are bound to keys by certificates and are unique in the network.
-- `wired members` lists the network's nodes.
+- `wired members` lists the network's nodes. `wired invite` prints the current invite again, and `wired relays` lists the network's relays.
 - `wired revoke <name>` removes a node now. Every node drops its connections to it within moments. The join secret rotates, so the command prints a new invite; existing members are unaffected (even one that was offline past its 24-hour certificate renews with its key, not the secret), and the revoked node can't rejoin under any key.
 - `wired rotate` replaces a leaked invite without revoking anyone.
 
@@ -159,7 +159,7 @@ Don't run `wired anchor` on an empty state directory if you meant to restore. It
 - The **invite is a credential**: it can add new nodes until the secret is rotated. Treat it like a password.
 - A new key joins by proving it knows the secret with an HMAC bound to the TLS session. The secret itself never goes over the wire. After that, the key itself is the identity.
 - Anchors give members 24-hour certificates that bind a name to a key. Certificates chain to the root key, and every node checks them before opening any service stream.
-- Revocations reach every connected node at once. A node cut off from all anchors catches up when it reconnects. Even then, a revoked node's certificate expires within 24 hours.
+- Revocations reach every connected node at once. A node cut off from all anchors catches up when it reconnects. Even then, a revoked node's certificate expires within 24 hours, and connections close when the peer's certificate expires.
 - Members cache their certificate and the network state, so they start even when no anchor is reachable, until that certificate expires.
 - Keys and state live in `$XDG_CONFIG_HOME/wired` (mode 0600/0700).
 
