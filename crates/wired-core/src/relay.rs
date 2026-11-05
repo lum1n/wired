@@ -364,6 +364,27 @@ mod tests {
     }
 
     #[test]
+    fn origin_accepts_only_bare_http_origins_and_drops_the_trailing_slash() {
+        assert_eq!(origin("https://r.example").unwrap(), "https://r.example");
+        assert_eq!(origin("https://r.example:7443/").unwrap(), "https://r.example:7443");
+        assert_eq!(origin("http://127.0.0.1:80").unwrap(), "http://127.0.0.1");
+        let too_long = format!("https://{}.example", "a".repeat(MAX_URL));
+        for bad in [
+            "r.example",
+            "ftp://r.example",
+            "https://user@r.example",
+            "https://user:pw@r.example",
+            "https://r.example/relay",
+            "https://r.example/?q=1",
+            "https://r.example/#frag",
+            "not a url",
+            too_long.as_str(),
+        ] {
+            assert!(origin(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn url_host_brackets_ipv6() {
         assert_eq!(url_host("::1"), "[::1]");
         assert_eq!(url_host("10.0.0.1"), "10.0.0.1");
